@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../lib/api";
 
@@ -6,6 +6,14 @@ export function useDashboard(pollMs = 3000) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  const refresh = useCallback(async () => {
+    const next = await api.dashboard();
+    setData(next);
+    setError("");
+    setLoading(false);
+    return next;
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -39,5 +47,5 @@ export function useDashboard(pollMs = 3000) {
     };
   }, [pollMs]);
 
-  return { data, loading, error, refresh: async () => setData(await api.dashboard()) };
+  return { data, loading, error, refresh };
 }

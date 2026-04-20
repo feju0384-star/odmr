@@ -17,6 +17,7 @@ import {
   IconAntennaBars5,
   IconChartLine,
   IconCpu,
+  IconCurrentLocation,
 } from "@tabler/icons-react";
 import { useLocation, useNavigate } from "react-router-dom";
 
@@ -25,6 +26,7 @@ const navItems = [
   { to: "/lockin", label: "锁相设置", subtitle: "通道参数和实时曲线", icon: IconAdjustmentsBolt },
   { to: "/microwave", label: "微波设置", subtitle: "CW / Sweep / FM", icon: IconAntennaBars5 },
   { to: "/odmr", label: "ODMR 扫描", subtitle: "两种扫描方式", icon: IconChartLine },
+  { to: "/current", label: "电流测量", subtitle: "标定与自动测量", icon: IconCurrentLocation },
 ];
 
 function Sidebar({ onNavigate }) {
@@ -83,11 +85,11 @@ function Sidebar({ onNavigate }) {
               Workflow
             </Text>
             <Text c="dimmed" mt={6} size="sm">
-              先连接设备，再配置锁相和微波参数，最后执行 ODMR。
+              先连接设备，再配置锁相和微波参数，最后执行 ODMR 或电流测量。
             </Text>
           </div>
           <Badge variant="light" color="cyan" size="lg">
-            4 Pages
+            5 Pages
           </Badge>
         </Group>
       </Box>
