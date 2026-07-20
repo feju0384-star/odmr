@@ -15,6 +15,7 @@ import {
 import { notifications } from "@mantine/notifications";
 
 import { MetricCard } from "../components/MetricCard";
+import { CurrentTrackingPanel } from "../components/CurrentTrackingPanel";
 import { PlotCard } from "../components/PlotCard";
 import { SectionCard } from "../components/SectionCard";
 import { useDashboard } from "../hooks/useDashboard";
@@ -38,6 +39,9 @@ function axisLabel(axis) {
 }
 
 function measurementModeLabel(mode) {
+  if (mode === "current_tracking") {
+    return "PID 双峰跟踪";
+  }
   if (mode === "current") {
     return "电流测量";
   }
@@ -1034,6 +1038,31 @@ export default function CurrentPage() {
 
       <Progress value={measurementProgress * 100} color="cyan" radius="xl" size="lg" />
 
+      <CurrentTrackingPanel
+        currentForm={currentForm}
+        calibrationPoints={calibrationPoints}
+        onAddPhysicalCalibrationPoint={(point) =>
+          setCalibrationPoints((previous) =>
+            [
+              ...previous,
+              {
+                id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+                created_at: new Date().toISOString(),
+                current_a: point.current_a,
+                resonance_splitting_hz: point.resonance_splitting_hz,
+                left_resonance_hz: point.left_resonance_hz,
+                right_resonance_hz: point.right_resonance_hz,
+                delta_f_sigma_hz: point.delta_f_sigma_hz,
+                source: "physical_peak_tracking",
+              },
+            ].sort((left, right) => Number(left.current_a) - Number(right.current_a))
+          )
+        }
+        lockinConnected={Boolean(data.lockin.connected)}
+        microwaveConnected={Boolean(data.microwave.connected)}
+        measurementBusy={isMeasurementRunning}
+      />
+
       <Grid gutter="lg">
         <Grid.Col span={{ base: 12, xl: 5 }}>
           <SectionCard
@@ -1261,7 +1290,7 @@ export default function CurrentPage() {
         <Grid.Col span={{ base: 12, xl: 7 }}>
           <SectionCard
             title="标定表"
-            description="每个标定点都保存左右过零点、劈裂量和自动扫描结果。"
+            description="连续 PID 电流换算只使用“物理峰心”来源的共振最低点劈裂；旧过零点标定仍保留给单次扫描。"
             badge={String(calibrationPoints.length)}
           >
             {calibrationPoints.length ? (
@@ -1271,8 +1300,8 @@ export default function CurrentPage() {
                     <Table.Tr>
                       <Table.Th>#</Table.Th>
                       <Table.Th>电流</Table.Th>
-                      <Table.Th>左点</Table.Th>
-                      <Table.Th>右点</Table.Th>
+                      <Table.Th>左点/峰心</Table.Th>
+                      <Table.Th>右点/峰心</Table.Th>
                       <Table.Th>劈裂</Table.Th>
                       <Table.Th>自动劈裂</Table.Th>
                       <Table.Th>来源</Table.Th>
@@ -1284,13 +1313,17 @@ export default function CurrentPage() {
                       <Table.Tr key={point.id}>
                         <Table.Td>{index + 1}</Table.Td>
                         <Table.Td>{formatCurrent(point.current_a)}</Table.Td>
-                        <Table.Td>{formatGHz(point.left_zero_crossing_hz)}</Table.Td>
-                        <Table.Td>{formatGHz(point.right_zero_crossing_hz)}</Table.Td>
-                        <Table.Td>{formatSplittingMHz(point.splitting_hz)}</Table.Td>
+                        <Table.Td>{formatGHz(point.left_resonance_hz ?? point.left_zero_crossing_hz)}</Table.Td>
+                        <Table.Td>{formatGHz(point.right_resonance_hz ?? point.right_zero_crossing_hz)}</Table.Td>
+                        <Table.Td>{formatSplittingMHz(point.resonance_splitting_hz ?? point.splitting_hz)}</Table.Td>
                         <Table.Td>{formatSplittingMHz(point.auto_splitting_hz)}</Table.Td>
                         <Table.Td>
                           <Badge variant="light" color={point.source === "manual" ? "orange" : "teal"}>
-                            {point.source === "manual" ? "手动选点" : "自动双点"}
+                            {point.source === "physical_peak_tracking"
+                              ? "物理峰心"
+                              : point.source === "manual"
+                                ? "手动选点"
+                                : "自动双点"}
                           </Badge>
                         </Table.Td>
                         <Table.Td>

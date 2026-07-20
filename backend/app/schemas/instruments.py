@@ -113,6 +113,68 @@ class CurrentScanRequest(BaseModel):
     phase_target: Literal["x_v", "y_v", "auto"] = "auto"
 
 
+class CurrentTrackingRequest(BaseModel):
+    channel_index: int = Field(default=0, ge=0)
+    independent_dc_channel_index: int = Field(default=-1, ge=-1)
+    tracking_target: Literal["complex_projection"] = "complex_projection"
+    start_hz: float = Field(default=2.83e9)
+    stop_hz: float = Field(default=2.91e9)
+    search_points: int = Field(default=121, ge=11, le=4001)
+    search_settle_ms: float = Field(default=10.0, ge=0.1, le=5000.0)
+    probe_offset_hz: float = Field(default=250_000.0, gt=0.0)
+    tracking_settle_ms: float = Field(default=3.0, ge=0.1, le=5000.0)
+    sample_averages: int = Field(default=1, ge=1, le=100)
+    kp: float = Field(default=0.45, ge=0.0, le=100.0)
+    ki_per_s: float = Field(default=0.03, ge=0.0, le=1000.0)
+    kd_s: float = Field(default=0.0, ge=0.0, le=1000.0)
+    derivative_filter_tau_s: float = Field(default=0.1, ge=0.0, le=60.0)
+    antiwindup_gain_per_s: float = Field(default=1.0, ge=0.0, le=1000.0)
+    max_step_hz: float = Field(default=500_000.0, gt=0.0)
+    maximum_slew_hz_per_s: float = Field(default=10_000_000.0, gt=0.0)
+    integral_limit_hz: float = Field(default=1_000_000.0, ge=0.0)
+    lock_error_limit_hz: float = Field(default=1_500_000.0, gt=0.0)
+    minimum_complex_fit_r2: float = Field(default=0.7, ge=0.0, le=1.0)
+    slope_epsilon: float = Field(default=1e-30, gt=0.0)
+    orthogonal_limit_fraction: float = Field(default=0.5, gt=0.0)
+    maximum_error_fraction: float = Field(default=0.8, gt=0.0, le=1.0)
+    minimum_depth_fraction: float = Field(default=0.15, ge=0.0, le=1.0)
+    slope_ratio_min: float = Field(default=0.3, gt=0.0)
+    slope_ratio_max: float = Field(default=3.0, gt=0.0)
+    maximum_slope_angle_change_rad: float = Field(default=1.0, gt=0.0)
+    verify_interval_visits: int = Field(default=20, ge=1, le=100000)
+    slope_verification_max_age_s: float = Field(default=10.0, gt=0.0)
+    bad_samples_to_suspect: int = Field(default=1, ge=1, le=1000)
+    bad_samples_to_lose: int = Field(default=3, ge=1, le=1000)
+    good_samples_to_lock: int = Field(default=3, ge=1, le=1000)
+    relock_gain_ramp_samples: int = Field(default=5, ge=1, le=1000)
+    saturation_loss_threshold: int = Field(default=5, ge=1, le=1000)
+    calibration_points_each_side: int = Field(default=2, ge=1, le=10)
+    enable_velocity_prediction: bool = True
+    velocity_filter_tau_s: float = Field(default=0.5, ge=0.0, le=60.0)
+    maximum_velocity_hz_per_s: float = Field(default=20_000_000.0, gt=0.0)
+    maximum_acceleration_hz_per_s2: float = Field(default=100_000_000.0, gt=0.0)
+    maximum_extrapolation_age_s: float = Field(default=1.0, gt=0.0, le=60.0)
+    maximum_delta_f_sigma_hz: float = Field(default=2_000_000.0, gt=0.0)
+    delta_f_min_hz: float = Field(default=0.0, ge=0.0)
+    delta_f_max_hz: float = Field(default=1_000_000_000.0, gt=0.0)
+    local_scan_points: int = Field(default=17, ge=7, le=501)
+    local_scan_initial_width_fraction: float = Field(default=1.0, gt=0.0)
+    local_scan_expansion_factor: float = Field(default=2.0, gt=1.0)
+    local_scan_max_expansions: int = Field(default=3, ge=1, le=20)
+    reacquire_identity_guard_fraction: float = Field(default=0.25, ge=0.0, le=2.0)
+    minimum_resolvable_separation_factor: float = Field(default=0.75, ge=0.0, le=10.0)
+    minimum_peak_prominence_fraction: float = Field(default=0.05, ge=0.0, le=1.0)
+    peak_pair_ambiguity_score_ratio: float = Field(default=0.9, gt=0.0, le=1.0)
+    relock_cooldown_s: float = Field(default=0.1, ge=0.0, le=60.0)
+    max_relock_attempts: int = Field(default=5, ge=0, le=1000)
+    max_tracking_duration_s: float = Field(default=0.0, ge=0.0, le=604800.0)
+    minimum_calibration_slope_a_per_hz: float | None = None
+    minimum_calibration_intercept_a: float | None = None
+    calibration_delta_f_min_hz: float | None = None
+    calibration_delta_f_max_hz: float | None = None
+    current_polarity_mode: Literal["magnitude", "signed_external"] = "magnitude"
+
+
 class ApiResponse(BaseModel):
     success: bool
     message: str

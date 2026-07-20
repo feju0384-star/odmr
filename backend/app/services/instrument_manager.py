@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import cmath
 import math
 import random
 import re
+import statistics
 import threading
 import time
 from collections import deque
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -33,6 +36,7 @@ except ImportError:  # pragma: no cover
 
 from backend.app.schemas.instruments import (
     CurrentScanRequest,
+    CurrentTrackingRequest,
     LabOneServerConfig,
     LockinChannelConfig,
     LockinConnectRequest,
@@ -41,6 +45,96 @@ from backend.app.schemas.instruments import (
     ODMRRequest,
     SensitivityRequest,
 )
+from backend.app.services.dual_peak_tracker import (
+    GlobalState,
+    PeakId,
+    PeakMeasurement,
+    PeakState,
+    PeakTracker,
+    QualityResult,
+    SpecPidController,
+    calculate_aligned_output,
+    calculate_frequency_error,
+    fit_complex_affine_model,
+    update_quality_state,
+)
+
+
+@dataclass
+class BoundedPidController:
+    kp: float
+    ki_per_s: float
+    kd_s: float
+    max_output_hz: float
+    integral_limit_hz: float
+    derivative_filter_alpha: float = 0.2
+    integral_error_s: float = 0.0
+    previous_error_hz: float | None = None
+    filtered_derivative_hz_per_s: float = 0.0
+
+    @staticmethod
+    def _clamp(value: float, limit: float) -> float:
+        if limit <= 0:
+            return 0.0
+        return max(-limit, min(limit, float(value)))
+
+    def reset(self) -> None:
+        self.integral_error_s = 0.0
+        self.previous_error_hz = None
+        self.filtered_derivative_hz_per_s = 0.0
+
+    def update(self, error_hz: float, dt_s: float) -> dict[str, float | bool]:
+        dt_s = max(float(dt_s), 1e-6)
+        error_hz = float(error_hz)
+        raw_derivative = (
+            0.0
+            if self.previous_error_hz is None
+            else (error_hz - self.previous_error_hz) / dt_s
+        )
+        alpha = max(0.0, min(1.0, float(self.derivative_filter_alpha)))
+        self.filtered_derivative_hz_per_s = (
+            alpha * raw_derivative + (1.0 - alpha) * self.filtered_derivative_hz_per_s
+        )
+
+        previous_integral = self.integral_error_s
+        candidate_integral = previous_integral + error_hz * dt_s
+        if self.ki_per_s > 0 and self.integral_limit_hz > 0:
+            candidate_integral = self._clamp(
+                candidate_integral,
+                self.integral_limit_hz / self.ki_per_s,
+            )
+        elif self.ki_per_s <= 0 or self.integral_limit_hz <= 0:
+            candidate_integral = 0.0
+
+        proportional_hz = self.kp * error_hz
+        derivative_hz = self.kd_s * self.filtered_derivative_hz_per_s
+        candidate_integral_hz = self.ki_per_s * candidate_integral
+        unsaturated_hz = proportional_hz + candidate_integral_hz + derivative_hz
+        saturated = abs(unsaturated_hz) > self.max_output_hz
+
+        # 条件积分抗饱和：只有未饱和，或误差正把输出从饱和边界拉回时才继续积分。
+        pushes_further_into_saturation = (
+            saturated
+            and error_hz != 0
+            and math.copysign(1.0, error_hz) == math.copysign(1.0, unsaturated_hz)
+        )
+        if pushes_further_into_saturation:
+            self.integral_error_s = previous_integral
+        else:
+            self.integral_error_s = candidate_integral
+
+        integral_hz = self.ki_per_s * self.integral_error_s
+        unsaturated_hz = proportional_hz + integral_hz + derivative_hz
+        output_hz = self._clamp(unsaturated_hz, self.max_output_hz)
+        self.previous_error_hz = error_hz
+        return {
+            "error_hz": error_hz,
+            "output_hz": output_hz,
+            "proportional_hz": proportional_hz,
+            "integral_hz": integral_hz,
+            "derivative_hz": derivative_hz,
+            "saturated": abs(unsaturated_hz) > self.max_output_hz,
+        }
 
 BWTC_SCALING = {
     1: 1.0,
@@ -115,6 +209,7 @@ class InstrumentManager:
         self.sampler_thread: threading.Thread | None = None
         self.sampler_stop_event = threading.Event()
         self.odmr_stop_event = threading.Event()
+        self.microwave_lock = threading.RLock()
 
         self.lockin_state: dict[str, Any] = {
             "connected": False,
@@ -162,6 +257,18 @@ class InstrumentManager:
             "last_sensitivity_result": {},
             "last_current_request": CurrentScanRequest().model_dump(),
             "last_current_result": {},
+            "last_current_tracking_request": CurrentTrackingRequest().model_dump(),
+            "last_current_tracking_result": {},
+            "tracking": {
+                "lock_state": "idle",
+                "cycle_index": 0,
+                "left_frequency_hz": 0.0,
+                "right_frequency_hz": 0.0,
+                "splitting_hz": 0.0,
+                "estimated_current_a": None,
+                "relock_count": 0,
+                "lost_lock_count": 0,
+            },
         }
         self.last_signal_channels = self._simulate_signal_channels()
         self._log("系统启动，后端进入待机状态。")
@@ -1704,9 +1811,10 @@ class InstrumentManager:
         self._log(f"Microwave IO failed: {message}", "error")
 
     def _microwave_apply_commands(self, commands: list[str], errors: list[str]) -> bool:
-        for command in commands:
-            if not self._microwave_write_checked(command, errors):
-                return False
+        with self.microwave_lock:
+            for command in commands:
+                if not self._microwave_write_checked(command, errors):
+                    return False
         return True
 
     def disconnect_microwave(self) -> dict[str, Any]:
@@ -1836,6 +1944,29 @@ class InstrumentManager:
             self._microwave_mark_io_failure(errors[0])
         return ok
 
+    def prepare_microwave_fast_tracking(self) -> bool:
+        if self.microwave_resource is None:
+            return False
+        errors: list[str] = []
+        ok = self._microwave_apply_commands([":FREQ:MODE CW", ":OUTP ON"], errors)
+        if not ok:
+            self._microwave_mark_io_failure(errors[0])
+            return False
+        self.microwave_state["config"]["mode"] = "cw"
+        self.microwave_state["config"]["output_enabled"] = True
+        return True
+
+    def set_microwave_frequency_fast(self, frequency_hz: float) -> bool:
+        """跟踪循环专用：CW 模式已经准备好时只发送一次频率写命令。"""
+        self.microwave_state["config"]["frequency_hz"] = float(frequency_hz)
+        if self.microwave_resource is None:
+            return False
+        errors: list[str] = []
+        ok = self._microwave_apply_commands([f":FREQ {float(frequency_hz):.9f}"], errors)
+        if not ok:
+            self._microwave_mark_io_failure(errors[0])
+        return ok
+
     def _odmr_delay_s(self, request: ODMRRequest) -> float:
         return min(max(request.dwell_ms / 1000.0, 0.005), 1.0)
 
@@ -1926,6 +2057,72 @@ class InstrumentManager:
                 "cancel_requested": False,
                 "last_current_request": request.model_dump(),
                 "last_current_result": result,
+            }
+        )
+        return result
+
+    def begin_current_tracking(self, request: CurrentTrackingRequest) -> None:
+        resolved_channel = self._resolve_measurement_channel_index(request.channel_index)
+        self.odmr_stop_event.clear()
+        tracking_state = {
+            "lock_state": "acquiring",
+            "cycle_index": 0,
+            "left_frequency_hz": 0.0,
+            "right_frequency_hz": 0.0,
+            "splitting_hz": 0.0,
+            "estimated_current_a": None,
+            "relock_count": 0,
+            "lost_lock_count": 0,
+        }
+        self.measurement_state.update(
+            {
+                "running": True,
+                "mode": "current_tracking",
+                "status": "正在扫描并捕获双峰",
+                "progress": 0.0,
+                "current_point": 0,
+                "current_frequency_hz": 0.0,
+                "current_value": 0.0,
+                "estimated_duration_s": float(request.max_tracking_duration_s),
+                "cancel_requested": False,
+                "last_current_tracking_request": {
+                    **request.model_dump(),
+                    "channel_index": resolved_channel,
+                },
+                "tracking": tracking_state,
+            }
+        )
+
+    def finish_current_tracking(
+        self,
+        request: CurrentTrackingRequest,
+        result: dict[str, Any],
+        status: str = "completed",
+    ) -> dict[str, Any]:
+        last_point = dict(result.get("last_point", {}) or {})
+        tracking_state = {
+            **dict(self.measurement_state.get("tracking", {}) or {}),
+            "lock_state": "idle" if status in ("completed", "cancelled") else "error",
+        }
+        self.measurement_state.update(
+            {
+                "running": False,
+                "mode": "idle",
+                "status": status,
+                "progress": 1.0 if status == "completed" else self.measurement_state.get("progress", 0.0),
+                "current_point": int(last_point.get("cycle_index", 0) or 0),
+                "current_frequency_hz": float(
+                    (
+                        float(last_point.get("left_frequency_hz", 0.0) or 0.0)
+                        + float(last_point.get("right_frequency_hz", 0.0) or 0.0)
+                    )
+                    / 2.0
+                ),
+                "current_value": float(last_point.get("splitting_hz", 0.0) or 0.0),
+                "cancel_requested": False,
+                "last_current_tracking_request": request.model_dump(),
+                "last_current_tracking_result": result,
+                "tracking": tracking_state,
             }
         )
         return result
@@ -2461,6 +2658,1560 @@ class InstrumentManager:
                 f"right={right_zero_crossing_hz / 1e9:.6f} GHz"
             )
             return result
+        finally:
+            try:
+                if original_microwave_config:
+                    self.update_microwave(MicrowaveConfigRequest(**original_microwave_config))
+            except Exception:
+                pass
+
+    @staticmethod
+    def estimate_tracking_error_from_triplet(
+        target: str,
+        probe_offset_hz: float,
+        minus_value: float,
+        center_value: float,
+        plus_value: float,
+    ) -> dict[str, float | bool]:
+        probe_offset_hz = float(probe_offset_hz)
+        minus_value = float(minus_value)
+        center_value = float(center_value)
+        plus_value = float(plus_value)
+        finite = all(
+            math.isfinite(value)
+            for value in (probe_offset_hz, minus_value, center_value, plus_value)
+        )
+        if not finite or probe_offset_hz <= 0:
+            return {
+                "valid": False,
+                "error_hz": math.nan,
+                "shape": math.nan,
+                "local_contrast_v": math.nan,
+            }
+
+        if target == "zero_crossing":
+            slope_v_per_hz = (plus_value - minus_value) / (2.0 * probe_offset_hz)
+            valid = math.isfinite(slope_v_per_hz) and abs(slope_v_per_hz) > 1e-30
+            error_hz = -center_value / slope_v_per_hz if valid else math.nan
+            return {
+                "valid": valid,
+                "error_hz": float(error_hz),
+                "shape": float(abs(slope_v_per_hz)),
+                "slope_v_per_hz": float(slope_v_per_hz),
+                "local_contrast_v": float(abs(plus_value - minus_value) / 2.0),
+            }
+
+        denominator_v = minus_value - 2.0 * center_value + plus_value
+        curvature_v_per_hz2 = denominator_v / (probe_offset_hz * probe_offset_hz)
+        valid = math.isfinite(curvature_v_per_hz2) and curvature_v_per_hz2 > 1e-30
+        error_hz = (
+            0.5 * probe_offset_hz * (minus_value - plus_value) / denominator_v
+            if valid
+            else math.nan
+        )
+        return {
+            "valid": valid,
+            "error_hz": float(error_hz),
+            "shape": float(curvature_v_per_hz2),
+            "curvature_v_per_hz2": float(curvature_v_per_hz2),
+            "local_contrast_v": float((minus_value + plus_value) / 2.0 - center_value),
+        }
+
+    def _sample_tracking_frequency(
+        self,
+        channel_index: int,
+        frequency_hz: float,
+        readout_source: str,
+        settle_ms: float,
+        averages: int,
+    ) -> float:
+        if self.odmr_stop_event.is_set():
+            raise RuntimeError("PID 双峰跟踪已停止。")
+        if not self.set_microwave_frequency_fast(frequency_hz):
+            raise RuntimeError(self.microwave_state.get("last_error") or "微波快速捷变频失败。")
+        time.sleep(self._measurement_settle_s(channel_index, settle_ms))
+        values: list[float] = []
+        for _ in range(max(1, int(averages))):
+            if self.odmr_stop_event.is_set():
+                raise RuntimeError("PID 双峰跟踪已停止。")
+            sample = self.read_lockin_sample_for_channel(channel_index)
+            values.append(float(sample.get(readout_source, 0.0) or 0.0))
+        return float(sum(values) / max(1, len(values)))
+
+    def _sample_tracking_triplet(
+        self,
+        request: CurrentTrackingRequest,
+        channel_index: int,
+        center_hz: float,
+        readout_source: str,
+    ) -> dict[str, float]:
+        offset_hz = float(request.probe_offset_hz)
+        minus_value = self._sample_tracking_frequency(
+            channel_index,
+            center_hz - offset_hz,
+            readout_source,
+            request.tracking_settle_ms,
+            request.sample_averages,
+        )
+        center_value = self._sample_tracking_frequency(
+            channel_index,
+            center_hz,
+            readout_source,
+            request.tracking_settle_ms,
+            request.sample_averages,
+        )
+        plus_value = self._sample_tracking_frequency(
+            channel_index,
+            center_hz + offset_hz,
+            readout_source,
+            request.tracking_settle_ms,
+            request.sample_averages,
+        )
+        return {
+            "minus_v": minus_value,
+            "center_v": center_value,
+            "plus_v": plus_value,
+        }
+
+    def _acquire_current_tracking_pair(
+        self,
+        request: CurrentTrackingRequest,
+        event_callback: Any | None = None,
+        reason: str = "initial",
+    ) -> dict[str, Any]:
+        scan_request = CurrentScanRequest(
+            channel_index=request.channel_index,
+            start_hz=request.start_hz,
+            stop_hz=request.stop_hz,
+            search_points=request.search_points,
+            settle_ms=request.search_settle_ms,
+            slope_fit_points=9,
+            phase_target="auto",
+        )
+
+        requested_target = request.tracking_target
+        if callable(event_callback):
+            event_callback(
+                {
+                    "type": "current_tracking_acquiring",
+                    "reason": reason,
+                    "requested_target": requested_target,
+                }
+            )
+
+        should_try_zero_crossing = requested_target == "zero_crossing" or (
+            requested_target == "auto"
+            and request.zero_crossing_calibration_slope_a_per_hz is not None
+            and request.zero_crossing_calibration_intercept_a is not None
+        )
+        if should_try_zero_crossing:
+            try:
+                scan_result = self.run_current_measurement(scan_request)
+                left_slope = float(scan_result.get("left_slope_v_per_hz", 0.0) or 0.0)
+                right_slope = float(scan_result.get("right_slope_v_per_hz", 0.0) or 0.0)
+                zero_valid = (
+                    math.isfinite(left_slope)
+                    and math.isfinite(right_slope)
+                    and abs(left_slope) > 1e-30
+                    and abs(right_slope) > 1e-30
+                    and float(scan_result.get("right_zero_crossing_hz", 0.0) or 0.0)
+                    > float(scan_result.get("left_zero_crossing_hz", 0.0) or 0.0)
+                )
+                if zero_valid:
+                    return {
+                        "tracking_target": "zero_crossing",
+                        "readout_source": str(scan_result.get("selected_axis", "x_v")),
+                        "left_frequency_hz": float(scan_result["left_zero_crossing_hz"]),
+                        "right_frequency_hz": float(scan_result["right_zero_crossing_hz"]),
+                        "left_reference_shape": abs(left_slope),
+                        "right_reference_shape": abs(right_slope),
+                        "scan_result": scan_result,
+                    }
+                if requested_target == "zero_crossing":
+                    raise RuntimeError("调相信号的左右过零点斜率无效。")
+            except Exception as exc:
+                minimum_fallback_available = (
+                    request.minimum_calibration_slope_a_per_hz is not None
+                    and request.minimum_calibration_intercept_a is not None
+                )
+                if (
+                    requested_target == "zero_crossing"
+                    or "已停止" in str(exc)
+                    or not minimum_fallback_available
+                ):
+                    raise
+                if callable(event_callback):
+                    event_callback(
+                        {
+                            "type": "current_tracking_target_fallback",
+                            "message": f"过零点捕获失败，自动切换到最低点跟踪: {exc}",
+                        }
+                    )
+
+        center_hz, span_hz = self._current_scan_window(scan_request)
+        trace = self._collect_complex_odmr_trace(
+            channel_index=self._resolve_measurement_channel_index(request.channel_index),
+            center_hz=center_hz,
+            span_hz=span_hz,
+            points=request.search_points,
+            settle_ms=request.search_settle_ms,
+        )
+        pair = self._find_split_resonance_pair(
+            frequency_hz=trace["frequency_hz"],
+            signal_v=trace["r_v"],
+            search_center_hz=center_hz,
+        )
+        return {
+            "tracking_target": "minimum",
+            "readout_source": "r_v",
+            "left_frequency_hz": float(pair["left_resonance_hz"]),
+            "right_frequency_hz": float(pair["right_resonance_hz"]),
+            "left_reference_shape": 0.0,
+            "right_reference_shape": 0.0,
+            "scan_result": {
+                "left_resonance_hz": float(pair["left_resonance_hz"]),
+                "right_resonance_hz": float(pair["right_resonance_hz"]),
+                "resonance_center_hz": float(pair["center_hz"]),
+                "resonance_splitting_hz": float(pair["splitting_hz"]),
+                "initial_trace": trace,
+            },
+        }
+
+    def _run_current_tracking_legacy(
+        self,
+        request: CurrentTrackingRequest,
+        event_callback: Any | None = None,
+    ) -> dict[str, Any]:
+        if np is None:
+            raise RuntimeError("numpy 不可用，无法执行 PID 双峰跟踪。")
+        if self.lockin_device is None or self.lockin_session is None:
+            raise RuntimeError("锁相未连接，无法执行 PID 双峰跟踪。")
+        if self.microwave_resource is None or not self.microwave_state.get("connected"):
+            raise RuntimeError("微波源未连接，无法执行 PID 双峰跟踪。")
+        if request.stop_hz <= request.start_hz:
+            raise RuntimeError("跟踪终止频率必须大于起始频率。")
+        if request.probe_offset_hz * 4.0 >= request.stop_hz - request.start_hz:
+            raise RuntimeError("捷变频探测偏移过大，请减小探测偏移或扩大搜索范围。")
+
+        channel_index = self._resolve_measurement_channel_index(request.channel_index)
+        original_microwave_config = dict(self.microwave_state.get("config", {}))
+        start_monotonic = time.monotonic()
+        last_update_monotonic = start_monotonic
+        cycle_index = 0
+        relock_count = 0
+        lost_lock_count = 0
+        invalid_cycles = 0
+        last_point: dict[str, Any] = {}
+
+        def publish(payload: dict[str, Any]) -> None:
+            if callable(event_callback):
+                event_callback(payload)
+
+        def make_pid() -> BoundedPidController:
+            return BoundedPidController(
+                kp=request.kp,
+                ki_per_s=request.ki_per_s,
+                kd_s=request.kd_s,
+                max_output_hz=request.max_step_hz,
+                integral_limit_hz=request.integral_limit_hz,
+                derivative_filter_alpha=request.derivative_filter_alpha,
+            )
+
+        left_pid = make_pid()
+        right_pid = make_pid()
+
+        def acquire(reason: str) -> tuple[dict[str, Any], dict[str, float], dict[str, float]]:
+            self.measurement_state["status"] = "正在重新扫描双峰" if reason != "initial" else "正在扫描双峰"
+            acquisition = self._acquire_current_tracking_pair(request, publish, reason)
+            self.measurement_state["mode"] = "current_tracking"
+            self.measurement_state["progress"] = 0.0
+            if not self.prepare_microwave_fast_tracking():
+                raise RuntimeError(self.microwave_state.get("last_error") or "无法进入快速捷变频模式。")
+            target = str(acquisition["tracking_target"])
+            source = str(acquisition["readout_source"])
+            left_triplet = self._sample_tracking_triplet(
+                request,
+                channel_index,
+                float(acquisition["left_frequency_hz"]),
+                source,
+            )
+            right_triplet = self._sample_tracking_triplet(
+                request,
+                channel_index,
+                float(acquisition["right_frequency_hz"]),
+                source,
+            )
+            left_estimate = self.estimate_tracking_error_from_triplet(
+                target,
+                request.probe_offset_hz,
+                left_triplet["minus_v"],
+                left_triplet["center_v"],
+                left_triplet["plus_v"],
+            )
+            right_estimate = self.estimate_tracking_error_from_triplet(
+                target,
+                request.probe_offset_hz,
+                right_triplet["minus_v"],
+                right_triplet["center_v"],
+                right_triplet["plus_v"],
+            )
+            if not bool(left_estimate["valid"]) or not bool(right_estimate["valid"]):
+                raise RuntimeError("重扫已找到双峰，但无法建立有效的局部斜率/曲率。")
+            # 失锁阈值必须与连续跟踪使用同一种三点估计器建立，避免全谱拟合
+            # 与局部探测偏移不同导致量纲虽相同、数值却不可直接比较。
+            acquisition["left_reference_shape"] = float(left_estimate["shape"])
+            acquisition["right_reference_shape"] = float(right_estimate["shape"])
+            acquisition["left_reference_contrast_v"] = max(
+                abs(float(left_estimate["local_contrast_v"])),
+                1e-30,
+            )
+            acquisition["right_reference_contrast_v"] = max(
+                abs(float(right_estimate["local_contrast_v"])),
+                1e-30,
+            )
+            return acquisition, left_triplet, right_triplet
+
+        def build_summary(status: str) -> dict[str, Any]:
+            return {
+                "status": status,
+                "started_at": datetime.fromtimestamp(
+                    time.time() - (time.monotonic() - start_monotonic)
+                ).isoformat(timespec="seconds"),
+                "ended_at": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_s": time.monotonic() - start_monotonic,
+                "cycles": cycle_index,
+                "relock_count": relock_count,
+                "lost_lock_count": lost_lock_count,
+                "last_point": last_point,
+            }
+
+        try:
+            if not self.prepare_microwave_fast_tracking():
+                raise RuntimeError(self.microwave_state.get("last_error") or "无法进入快速捷变频模式。")
+            acquisition, _, _ = acquire("initial")
+            left_frequency_hz = float(acquisition["left_frequency_hz"])
+            right_frequency_hz = float(acquisition["right_frequency_hz"])
+            tracking_target = str(acquisition["tracking_target"])
+            readout_source = str(acquisition["readout_source"])
+            left_reference_shape = float(acquisition["left_reference_shape"])
+            right_reference_shape = float(acquisition["right_reference_shape"])
+            left_reference_contrast_v = float(acquisition["left_reference_contrast_v"])
+            right_reference_contrast_v = float(acquisition["right_reference_contrast_v"])
+            left_pid.reset()
+            right_pid.reset()
+            self.measurement_state["status"] = "双峰已锁定"
+            publish(
+                {
+                    "type": "current_tracking_locked",
+                    "reason": "initial",
+                    "tracking_target": tracking_target,
+                    "readout_source": readout_source,
+                    "left_frequency_hz": left_frequency_hz,
+                    "right_frequency_hz": right_frequency_hz,
+                    "splitting_hz": right_frequency_hz - left_frequency_hz,
+                    "scan_result": acquisition["scan_result"],
+                }
+            )
+
+            while not self.odmr_stop_event.is_set():
+                cycle_started = time.monotonic()
+                elapsed_s = cycle_started - start_monotonic
+                if request.max_tracking_duration_s > 0 and elapsed_s >= request.max_tracking_duration_s:
+                    break
+
+                left_triplet = self._sample_tracking_triplet(
+                    request,
+                    channel_index,
+                    left_frequency_hz,
+                    readout_source,
+                )
+                right_triplet = self._sample_tracking_triplet(
+                    request,
+                    channel_index,
+                    right_frequency_hz,
+                    readout_source,
+                )
+                left_estimate = self.estimate_tracking_error_from_triplet(
+                    tracking_target,
+                    request.probe_offset_hz,
+                    left_triplet["minus_v"],
+                    left_triplet["center_v"],
+                    left_triplet["plus_v"],
+                )
+                right_estimate = self.estimate_tracking_error_from_triplet(
+                    tracking_target,
+                    request.probe_offset_hz,
+                    right_triplet["minus_v"],
+                    right_triplet["center_v"],
+                    right_triplet["plus_v"],
+                )
+
+                loss_reasons: list[str] = []
+                for side, estimate, reference_shape, reference_contrast in (
+                    ("左峰", left_estimate, left_reference_shape, left_reference_contrast_v),
+                    ("右峰", right_estimate, right_reference_shape, right_reference_contrast_v),
+                ):
+                    error_hz = float(estimate["error_hz"])
+                    shape = float(estimate["shape"])
+                    contrast_v = abs(float(estimate["local_contrast_v"]))
+                    if not bool(estimate["valid"]) or not math.isfinite(error_hz):
+                        loss_reasons.append(f"{side}局部拟合无效")
+                    elif abs(error_hz) > request.lock_error_limit_hz:
+                        loss_reasons.append(f"{side}偏差超限")
+                    if shape < reference_shape * request.minimum_curvature_ratio:
+                        loss_reasons.append(f"{side}斜率/曲率衰减")
+                    if (
+                        tracking_target == "minimum"
+                        and contrast_v < reference_contrast * request.minimum_contrast_ratio
+                    ):
+                        loss_reasons.append(f"{side}对比度不足")
+
+                if not (
+                    request.start_hz + request.probe_offset_hz
+                    <= left_frequency_hz
+                    < right_frequency_hz
+                    <= request.stop_hz - request.probe_offset_hz
+                ):
+                    loss_reasons.append("跟踪频率越出搜索窗口")
+
+                if loss_reasons:
+                    invalid_cycles += 1
+                    lost_lock_count += 1
+                    self.measurement_state["status"] = (
+                        f"锁定质量告警 {invalid_cycles}/{request.lost_lock_cycles}"
+                    )
+                    publish(
+                        {
+                            "type": "current_tracking_lock_warning",
+                            "consecutive_invalid_cycles": invalid_cycles,
+                            "lost_lock_cycles": request.lost_lock_cycles,
+                            "reasons": loss_reasons,
+                            "left_error_hz": (
+                                float(left_estimate["error_hz"])
+                                if math.isfinite(float(left_estimate["error_hz"]))
+                                else None
+                            ),
+                            "right_error_hz": (
+                                float(right_estimate["error_hz"])
+                                if math.isfinite(float(right_estimate["error_hz"]))
+                                else None
+                            ),
+                        }
+                    )
+                    if invalid_cycles < request.lost_lock_cycles:
+                        continue
+
+                    relock_count += 1
+                    publish(
+                        {
+                            "type": "current_tracking_lock_lost",
+                            "relock_count": relock_count,
+                            "reasons": loss_reasons,
+                        }
+                    )
+                    if request.max_relock_attempts and relock_count > request.max_relock_attempts:
+                        raise RuntimeError(
+                            f"双峰连续失锁，自动重扫已超过 {request.max_relock_attempts} 次。"
+                        )
+                    if request.relock_cooldown_s > 0:
+                        time.sleep(request.relock_cooldown_s)
+                    acquisition, _, _ = acquire("lock_lost")
+                    left_frequency_hz = float(acquisition["left_frequency_hz"])
+                    right_frequency_hz = float(acquisition["right_frequency_hz"])
+                    tracking_target = str(acquisition["tracking_target"])
+                    readout_source = str(acquisition["readout_source"])
+                    left_reference_shape = float(acquisition["left_reference_shape"])
+                    right_reference_shape = float(acquisition["right_reference_shape"])
+                    left_reference_contrast_v = float(acquisition["left_reference_contrast_v"])
+                    right_reference_contrast_v = float(acquisition["right_reference_contrast_v"])
+                    left_pid.reset()
+                    right_pid.reset()
+                    invalid_cycles = 0
+                    last_update_monotonic = time.monotonic()
+                    self.measurement_state["status"] = "重扫成功，双峰已重新锁定"
+                    publish(
+                        {
+                            "type": "current_tracking_locked",
+                            "reason": "reacquired",
+                            "relock_count": relock_count,
+                            "tracking_target": tracking_target,
+                            "readout_source": readout_source,
+                            "left_frequency_hz": left_frequency_hz,
+                            "right_frequency_hz": right_frequency_hz,
+                            "splitting_hz": right_frequency_hz - left_frequency_hz,
+                            "scan_result": acquisition["scan_result"],
+                        }
+                    )
+                    continue
+
+                invalid_cycles = 0
+                now_monotonic = time.monotonic()
+                dt_s = max(now_monotonic - last_update_monotonic, 1e-6)
+                last_update_monotonic = now_monotonic
+                left_error_hz = float(left_estimate["error_hz"])
+                right_error_hz = float(right_estimate["error_hz"])
+                measured_left_frequency_hz = left_frequency_hz + left_error_hz
+                measured_right_frequency_hz = right_frequency_hz + right_error_hz
+                measured_splitting_hz = measured_right_frequency_hz - measured_left_frequency_hz
+                if measured_splitting_hz <= 0:
+                    invalid_cycles = request.lost_lock_cycles
+                    continue
+                left_control = left_pid.update(left_error_hz, dt_s)
+                right_control = right_pid.update(right_error_hz, dt_s)
+
+                lower_bound_hz = request.start_hz + request.probe_offset_hz
+                upper_bound_hz = request.stop_hz - request.probe_offset_hz
+                proposed_left_hz = left_frequency_hz + float(left_control["output_hz"])
+                proposed_right_hz = right_frequency_hz + float(right_control["output_hz"])
+                left_frequency_hz = max(lower_bound_hz, min(upper_bound_hz, proposed_left_hz))
+                right_frequency_hz = max(lower_bound_hz, min(upper_bound_hz, proposed_right_hz))
+                if right_frequency_hz <= left_frequency_hz:
+                    invalid_cycles = request.lost_lock_cycles
+                    continue
+
+                cycle_index += 1
+                if tracking_target == "zero_crossing":
+                    calibration_slope = request.zero_crossing_calibration_slope_a_per_hz
+                    calibration_intercept = request.zero_crossing_calibration_intercept_a
+                else:
+                    calibration_slope = request.minimum_calibration_slope_a_per_hz
+                    calibration_intercept = request.minimum_calibration_intercept_a
+                estimated_current_a = (
+                    float(calibration_slope) * measured_splitting_hz + float(calibration_intercept)
+                    if calibration_slope is not None and calibration_intercept is not None
+                    else None
+                )
+                cycle_duration_s = max(time.monotonic() - cycle_started, 1e-9)
+                last_point = {
+                    "timestamp": time.time(),
+                    "timestamp_iso": datetime.now().isoformat(timespec="milliseconds"),
+                    "elapsed_s": time.monotonic() - start_monotonic,
+                    "cycle_index": cycle_index,
+                    "cycle_duration_s": cycle_duration_s,
+                    "update_rate_hz": 1.0 / cycle_duration_s,
+                    "tracking_target": tracking_target,
+                    "readout_source": readout_source,
+                    "lock_state": "locked",
+                    "left_frequency_hz": measured_left_frequency_hz,
+                    "right_frequency_hz": measured_right_frequency_hz,
+                    "splitting_hz": measured_splitting_hz,
+                    "left_setpoint_hz": left_frequency_hz,
+                    "right_setpoint_hz": right_frequency_hz,
+                    "estimated_current_a": estimated_current_a,
+                    "left_error_hz": left_error_hz,
+                    "right_error_hz": right_error_hz,
+                    "left_shape": float(left_estimate["shape"]),
+                    "right_shape": float(right_estimate["shape"]),
+                    "left_pid": left_control,
+                    "right_pid": right_control,
+                    "left_probe": left_triplet,
+                    "right_probe": right_triplet,
+                    "relock_count": relock_count,
+                    "lost_lock_count": lost_lock_count,
+                }
+                tracking_state = {
+                    "lock_state": "locked",
+                    "cycle_index": cycle_index,
+                    "left_frequency_hz": measured_left_frequency_hz,
+                    "right_frequency_hz": measured_right_frequency_hz,
+                    "left_setpoint_hz": left_frequency_hz,
+                    "right_setpoint_hz": right_frequency_hz,
+                    "splitting_hz": measured_splitting_hz,
+                    "estimated_current_a": estimated_current_a,
+                    "relock_count": relock_count,
+                    "lost_lock_count": lost_lock_count,
+                    "tracking_target": tracking_target,
+                    "update_rate_hz": last_point["update_rate_hz"],
+                }
+                self.measurement_state.update(
+                    {
+                        "mode": "current_tracking",
+                        "status": "双峰已锁定",
+                        "progress": (
+                            min(
+                                1.0,
+                                float(last_point["elapsed_s"]) / request.max_tracking_duration_s,
+                            )
+                            if request.max_tracking_duration_s > 0
+                            else 0.0
+                        ),
+                        "current_point": cycle_index,
+                        "current_frequency_hz": (
+                            measured_left_frequency_hz + measured_right_frequency_hz
+                        )
+                        / 2.0,
+                        "current_value": measured_splitting_hz,
+                        "tracking": tracking_state,
+                    }
+                )
+                publish({"type": "current_tracking_point", "point": last_point})
+
+            status = "cancelled" if self.odmr_stop_event.is_set() else "completed"
+            return build_summary(status)
+        except RuntimeError as exc:
+            if self.odmr_stop_event.is_set() and "已停止" in str(exc):
+                return build_summary("cancelled")
+            raise
+        finally:
+            try:
+                if original_microwave_config:
+                    self.update_microwave(MicrowaveConfigRequest(**original_microwave_config))
+            except Exception:
+                pass
+
+    def run_current_tracking(
+        self,
+        request: CurrentTrackingRequest,
+        event_callback: Any | None = None,
+    ) -> dict[str, Any]:
+        """按规范执行 DC 峰心 + 复数 b/g 鉴频的双峰交替闭环。"""
+        if np is None:
+            raise RuntimeError("numpy 不可用，无法执行规范化双峰跟踪。")
+        if self.lockin_device is None or self.lockin_session is None:
+            raise RuntimeError("锁相未连接，无法执行规范化双峰跟踪。")
+        if self.microwave_resource is None or not self.microwave_state.get("connected"):
+            raise RuntimeError("微波源未连接，无法执行规范化双峰跟踪。")
+        if request.stop_hz <= request.start_hz:
+            raise RuntimeError("跟踪终止频率必须大于起始频率。")
+        if request.bad_samples_to_lose < request.bad_samples_to_suspect:
+            raise RuntimeError("bad_samples_to_lose 不能小于 bad_samples_to_suspect。")
+        if request.slope_ratio_max <= request.slope_ratio_min:
+            raise RuntimeError("实时斜率比例上限必须大于下限。")
+        if request.delta_f_max_hz <= request.delta_f_min_hz:
+            raise RuntimeError("Δf 物理上限必须大于下限。")
+
+        channel_index = self._resolve_measurement_channel_index(request.channel_index)
+        dc_channel_index = (
+            self._resolve_measurement_channel_index(request.independent_dc_channel_index)
+            if request.independent_dc_channel_index >= 0
+            else channel_index
+        )
+        independent_dc = (
+            request.independent_dc_channel_index >= 0 and dc_channel_index != channel_index
+        )
+        original_microwave_config = dict(self.microwave_state.get("config", {}))
+        # Windows 的 time.monotonic() 可能退化到低分辨率 GetTickCount64；
+        # perf_counter 同样单调且使用高分辨率 QPC，满足实时 dt 要求。
+        clock = time.perf_counter
+        started_monotonic_s = clock()
+        started_wall_iso = datetime.now().isoformat(timespec="seconds")
+        global_state = GlobalState.BOOT
+        cycle_index = 0
+        relock_count = 0
+        lost_lock_count = 0
+        last_point: dict[str, Any] = {}
+
+        def publish(payload: dict[str, Any]) -> None:
+            if callable(event_callback):
+                event_callback(payload)
+
+        def check_stopped() -> None:
+            if self.odmr_stop_event.is_set():
+                raise RuntimeError("PID 双峰跟踪已停止。")
+
+        def acquire_at(peak_id: PeakId, frequency_hz: float) -> PeakMeasurement:
+            check_stopped()
+            if not math.isfinite(frequency_hz):
+                raise RuntimeError("频率命令包含 NaN/Inf。")
+            if not request.start_hz <= frequency_hz <= request.stop_hz:
+                raise RuntimeError("频率命令越出硬件/跟踪范围。")
+            if not self.set_microwave_frequency_fast(frequency_hz):
+                raise RuntimeError(
+                    self.microwave_state.get("last_error") or "微波快速捷变频失败。"
+                )
+            time.sleep(self._measurement_settle_s(channel_index, request.tracking_settle_ms))
+            x_blocks: list[float] = []
+            y_blocks: list[float] = []
+            dc_blocks: list[float] = []
+            total_blocks = max(1, int(request.sample_averages))
+            for _ in range(total_blocks):
+                check_stopped()
+                primary = self.read_lockin_sample_for_channel(channel_index)
+                dc_sample = (
+                    self.read_lockin_sample_for_channel(dc_channel_index)
+                    if independent_dc
+                    else primary
+                )
+                x_value = float(primary.get("x_v", math.nan))
+                y_value = float(primary.get("y_v", math.nan))
+                dc_value = float(dc_sample.get("r_v", math.nan))
+                if all(math.isfinite(value) for value in (x_value, y_value, dc_value)):
+                    x_blocks.append(x_value)
+                    y_blocks.append(y_value)
+                    dc_blocks.append(dc_value)
+            valid_blocks = min(len(x_blocks), len(y_blocks), len(dc_blocks))
+            return PeakMeasurement(
+                timestamp_s=clock(),
+                commanded_frequency_hz=float(frequency_hz),
+                x1=float(statistics.median(x_blocks)) if x_blocks else math.nan,
+                y1=float(statistics.median(y_blocks)) if y_blocks else math.nan,
+                dc=float(statistics.median(dc_blocks)) if dc_blocks else math.nan,
+                source_settled=True,
+                adc_valid=valid_blocks > 0,
+                detector_overload=False,
+                source_fault=self.microwave_resource is None,
+                valid_blocks=valid_blocks,
+                total_blocks=total_blocks,
+            )
+
+        def estimate_fwhm(
+            frequency_hz: list[float],
+            dc_values: list[float],
+            center_hz: float,
+            baseline: float,
+        ) -> float:
+            frequency = np.asarray(frequency_hz, dtype=float)
+            dc = np.asarray(dc_values, dtype=float)
+            center_index = int(np.argmin(np.abs(frequency - center_hz)))
+            center_value = float(dc[center_index])
+            depth = max(float(baseline) - center_value, 0.0)
+            if depth <= 0:
+                return max(float(np.median(np.diff(frequency))) * 6.0, 1.0)
+            half_level = baseline - depth / 2.0
+            left_candidates = np.where(dc[:center_index] >= half_level)[0]
+            right_candidates = np.where(dc[center_index + 1 :] >= half_level)[0]
+            if not left_candidates.size or not right_candidates.size:
+                return max(float(np.median(np.diff(frequency))) * 6.0, 1.0)
+            left_hz = float(frequency[int(left_candidates[-1])])
+            right_hz = float(frequency[center_index + 1 + int(right_candidates[0])])
+            return max(right_hz - left_hz, float(np.median(np.diff(frequency))), 1.0)
+
+        def detect_unique_peak_pair(
+            frequency_hz: Any,
+            dc_values: list[float],
+        ) -> dict[str, float | int]:
+            frequency = np.asarray(frequency_hz, dtype=float)
+            dc = np.asarray(dc_values, dtype=float)
+            if frequency.size < 7 or frequency.size != dc.size:
+                raise RuntimeError("完整扫频有效点不足，无法识别双峰。")
+            smoothed = np.convolve(dc, np.asarray([0.25, 0.5, 0.25]), mode="same")
+            smoothed[0] = dc[0]
+            smoothed[-1] = dc[-1]
+            baseline = float(np.median(smoothed))
+            candidates: list[tuple[int, float]] = []
+            for index in range(1, smoothed.size - 1):
+                if smoothed[index] <= smoothed[index - 1] and smoothed[index] <= smoothed[index + 1]:
+                    candidates.append((index, max(0.0, baseline - float(smoothed[index]))))
+            if not candidates:
+                raise RuntimeError("完整扫频未发现共振最低点。")
+            max_depth = max(item[1] for item in candidates)
+            minimum_depth = request.minimum_peak_prominence_fraction * max_depth
+            candidates = [item for item in candidates if item[1] >= minimum_depth and item[1] > 0]
+            pairs: list[tuple[float, int, int, float, float]] = []
+            for left_position, (left_index, left_depth) in enumerate(candidates):
+                for right_index, right_depth in candidates[left_position + 1 :]:
+                    separation_hz = float(frequency[right_index] - frequency[left_index])
+                    if not request.delta_f_min_hz <= separation_hz <= request.delta_f_max_hz:
+                        continue
+                    score = left_depth + right_depth
+                    pairs.append(
+                        (score, left_index, right_index, left_depth, right_depth)
+                    )
+            if not pairs:
+                raise RuntimeError("未找到满足 Δf 物理范围的唯一双峰组合。")
+            pairs.sort(key=lambda item: item[0], reverse=True)
+            if (
+                len(pairs) > 1
+                and pairs[0][0] > 0
+                and pairs[1][0] / pairs[0][0] >= request.peak_pair_ambiguity_score_ratio
+            ):
+                raise RuntimeError("双峰候选组合存在歧义，拒绝猜测峰身份。")
+            _, left_index, right_index, left_depth, right_depth = pairs[0]
+            left_hz = self._refine_extremum_frequency(frequency, dc, left_index)
+            right_hz = self._refine_extremum_frequency(frequency, dc, right_index)
+            if not left_hz < right_hz:
+                raise RuntimeError("双峰候选身份顺序异常。")
+            return {
+                "left_index": left_index,
+                "right_index": right_index,
+                "left_resonance_hz": left_hz,
+                "right_resonance_hz": right_hz,
+                "left_depth": left_depth,
+                "right_depth": right_depth,
+            }
+
+        def identity_bounds(
+            tracker: PeakTracker,
+            other: PeakTracker,
+        ) -> tuple[float, float]:
+            tracker_center = (
+                tracker.motion.center_hz if tracker.motion.initialized else tracker.command_hz
+            )
+            other_center = other.motion.center_hz if other.motion.initialized else other.command_hz
+            left_center = tracker_center if tracker.id == PeakId.LEFT else other_center
+            right_center = other_center if tracker.id == PeakId.LEFT else tracker_center
+            midpoint_hz = 0.5 * (left_center + right_center)
+            guard_hz = request.reacquire_identity_guard_fraction * min(
+                tracker.model.fwhm_hz,
+                other.model.fwhm_hz,
+            )
+            if tracker.id == PeakId.LEFT:
+                return request.start_hz, min(request.stop_hz, midpoint_hz - guard_hz)
+            return max(request.start_hz, midpoint_hz + guard_hz), request.stop_hz
+
+        def make_pid(fwhm_hz: float) -> SpecPidController:
+            return SpecPidController(
+                kp=request.kp,
+                ki_per_s=request.ki_per_s,
+                kd_s=request.kd_s,
+                derivative_filter_tau_s=request.derivative_filter_tau_s,
+                antiwindup_gain_per_s=request.antiwindup_gain_per_s,
+                integrator_limit_hz=request.integral_limit_hz,
+                maximum_step_hz=min(request.max_step_hz, 0.2 * fwhm_hz),
+                maximum_slew_hz_per_s=request.maximum_slew_hz_per_s,
+            )
+
+        def calibrate_peak(
+            *,
+            peak_id: PeakId,
+            center_hz: float,
+            fwhm_hz: float,
+            depth_reference: float,
+            dc_center_reference: float,
+            dc_baseline: float,
+            band_min_hz: float,
+            band_max_hz: float,
+            version: int,
+        ):
+            span_hz = min(
+                0.35 * fwhm_hz,
+                max(request.probe_offset_hz, 0.15 * fwhm_hz),
+                center_hz - band_min_hz,
+                band_max_hz - center_hz,
+            )
+            if not math.isfinite(span_hz) or span_hz <= 0:
+                raise RuntimeError(f"{peak_id.value} 峰复数标定窗口无效。")
+            offsets = np.linspace(
+                -span_hz,
+                span_hz,
+                2 * request.calibration_points_each_side + 1,
+            )
+            measurements = [
+                acquire_at(peak_id, float(center_hz + offset)) for offset in offsets
+            ]
+            if not all(item.basic_valid() for item in measurements):
+                raise RuntimeError(f"{peak_id.value} 峰复数标定采样无效。")
+            model = fit_complex_affine_model(
+                frequencies_hz=[item.commanded_frequency_hz for item in measurements],
+                x_values=[item.x1 for item in measurements],
+                y_values=[item.y1 for item in measurements],
+                center_hz=center_hz,
+                fwhm_hz=fwhm_hz,
+                depth_reference=depth_reference,
+                dc_center_reference=dc_center_reference,
+                dc_baseline_at_center=dc_baseline,
+                local_band_min_hz=band_min_hz,
+                local_band_max_hz=band_max_hz,
+                minimum_fit_r2=request.minimum_complex_fit_r2,
+                slope_epsilon=request.slope_epsilon,
+                orthogonal_limit_fraction=request.orthogonal_limit_fraction,
+            )
+            model.version = version
+            return model, measurements[-1].timestamp_s
+
+        def full_acquire(reason: str) -> tuple[PeakTracker, PeakTracker]:
+            nonlocal global_state
+            global_state = (
+                GlobalState.FULL_REACQUIRE if reason != "initial" else GlobalState.FULL_SCAN
+            )
+            self.measurement_state.update(
+                {
+                    "mode": "current_tracking",
+                    "status": "全频段重新扫峰" if reason != "initial" else "完整扫频",
+                    "progress": 0.0,
+                }
+            )
+            publish(
+                {
+                    "type": "current_tracking_state",
+                    "global_state": global_state.value,
+                    "output_valid": False,
+                    "invalid_reason": "full_reacquire" if reason != "initial" else "full_scan",
+                }
+            )
+            frequencies = np.linspace(
+                request.start_hz,
+                request.stop_hz,
+                request.search_points,
+            )
+            scan_measurements: list[PeakMeasurement] = []
+            for index, frequency_hz in enumerate(frequencies):
+                scan_measurements.append(acquire_at(PeakId.LEFT, float(frequency_hz)))
+                self.measurement_state["progress"] = (index + 1) / max(1, frequencies.size)
+            if not all(item.basic_valid() for item in scan_measurements):
+                raise RuntimeError("完整扫频包含无效采样，无法可靠分配双峰身份。")
+            dc_values = [item.dc for item in scan_measurements]
+            baseline = float(np.median(np.asarray(dc_values, dtype=float)))
+            pair = detect_unique_peak_pair(frequencies, dc_values)
+            left_center_hz = float(pair["left_resonance_hz"])
+            right_center_hz = float(pair["right_resonance_hz"])
+            if not left_center_hz < right_center_hz:
+                raise RuntimeError("双峰身份分配失败：左峰不小于右峰。")
+            left_fwhm_hz = estimate_fwhm(
+                frequencies.tolist(),
+                dc_values,
+                left_center_hz,
+                baseline,
+            )
+            right_fwhm_hz = estimate_fwhm(
+                frequencies.tolist(),
+                dc_values,
+                right_center_hz,
+                baseline,
+            )
+            separation_hz = right_center_hz - left_center_hz
+            if separation_hz < request.minimum_resolvable_separation_factor * max(
+                left_fwhm_hz,
+                right_fwhm_hz,
+            ):
+                raise RuntimeError("双峰间距小于可分辨阈值，禁止输出电流。")
+            midpoint_hz = 0.5 * (left_center_hz + right_center_hz)
+            guard_hz = request.reacquire_identity_guard_fraction * min(
+                left_fwhm_hz,
+                right_fwhm_hz,
+            )
+            left_band = (request.start_hz, midpoint_hz - guard_hz)
+            right_band = (midpoint_hz + guard_hz, request.stop_hz)
+            left_dc = float(
+                np.interp(left_center_hz, frequencies, np.asarray(dc_values, dtype=float))
+            )
+            right_dc = float(
+                np.interp(right_center_hz, frequencies, np.asarray(dc_values, dtype=float))
+            )
+            global_state = GlobalState.CALIBRATE
+            publish(
+                {
+                    "type": "current_tracking_state",
+                    "global_state": global_state.value,
+                    "output_valid": False,
+                    "invalid_reason": "calibrating_complex_models",
+                    "left_center_hz": left_center_hz,
+                    "right_center_hz": right_center_hz,
+                }
+            )
+            left_model, left_timestamp_s = calibrate_peak(
+                peak_id=PeakId.LEFT,
+                center_hz=left_center_hz,
+                fwhm_hz=left_fwhm_hz,
+                depth_reference=max(baseline - left_dc, 0.0),
+                dc_center_reference=left_dc,
+                dc_baseline=baseline,
+                band_min_hz=left_band[0],
+                band_max_hz=left_band[1],
+                version=relock_count + 1,
+            )
+            right_model, right_timestamp_s = calibrate_peak(
+                peak_id=PeakId.RIGHT,
+                center_hz=right_center_hz,
+                fwhm_hz=right_fwhm_hz,
+                depth_reference=max(baseline - right_dc, 0.0),
+                dc_center_reference=right_dc,
+                dc_baseline=baseline,
+                band_min_hz=right_band[0],
+                band_max_hz=right_band[1],
+                version=relock_count + 1,
+            )
+            left = PeakTracker(
+                id=PeakId.LEFT,
+                model=left_model,
+                pid=make_pid(left_fwhm_hz),
+                command_hz=left_center_hz,
+                last_slope_verification_s=left_timestamp_s,
+            )
+            right = PeakTracker(
+                id=PeakId.RIGHT,
+                model=right_model,
+                pid=make_pid(right_fwhm_hz),
+                command_hz=right_center_hz,
+                last_slope_verification_s=right_timestamp_s,
+            )
+            left.motion.update(
+                left_center_hz,
+                left_timestamp_s,
+                request.velocity_filter_tau_s,
+                request.maximum_velocity_hz_per_s,
+                request.maximum_acceleration_hz_per_s2,
+            )
+            right.motion.update(
+                right_center_hz,
+                right_timestamp_s,
+                request.velocity_filter_tau_s,
+                request.maximum_velocity_hz_per_s,
+                request.maximum_acceleration_hz_per_s2,
+            )
+            global_state = GlobalState.TRACK
+            self.measurement_state.update(
+                {
+                    "mode": "current_tracking",
+                    "status": "复数模型已标定，等待锁定确认",
+                    "progress": 0.0,
+                }
+            )
+            publish(
+                {
+                    "type": "current_tracking_models_calibrated",
+                    "global_state": global_state.value,
+                    "tracking_target": "complex_projection",
+                    "left_model": left_model.as_dict(),
+                    "right_model": right_model.as_dict(),
+                    "dc_independent": independent_dc,
+                }
+            )
+            return left, right
+
+        def verify_live_slope(tracker: PeakTracker) -> bool:
+            delta_hz = min(
+                request.probe_offset_hz,
+                0.15 * tracker.model.fwhm_hz,
+                0.5 * tracker.model.error_linear_limit_hz,
+            )
+            if delta_hz <= 0:
+                return False
+            minus = acquire_at(tracker.id, tracker.command_hz - delta_hz)
+            plus = acquire_at(tracker.id, tracker.command_hz + delta_hz)
+            g_live = (plus.z1 - minus.z1) / (2.0 * delta_hz)
+            if abs(tracker.model.g) ** 2 <= request.slope_epsilon:
+                return False
+            slope_ratio = abs(g_live) / abs(tracker.model.g)
+            angle_change = abs(
+                math.atan2(
+                    math.sin(cmath.phase(g_live / tracker.model.g)),
+                    math.cos(cmath.phase(g_live / tracker.model.g)),
+                )
+            )
+            valid = (
+                request.slope_ratio_min <= slope_ratio <= request.slope_ratio_max
+                and angle_change <= request.maximum_slope_angle_change_rad
+                and minus.basic_valid()
+                and plus.basic_valid()
+            )
+            publish(
+                {
+                    "type": "current_tracking_slope_verification",
+                    "peak_id": tracker.id.value,
+                    "valid": valid,
+                    "slope_ratio": slope_ratio if math.isfinite(slope_ratio) else None,
+                    "slope_angle_change_rad": (
+                        angle_change if math.isfinite(angle_change) else None
+                    ),
+                }
+            )
+            if valid:
+                tracker.model.g = 0.95 * tracker.model.g + 0.05 * g_live
+                tracker.model.version += 1
+                tracker.last_slope_verification_s = max(
+                    minus.timestamp_s,
+                    plus.timestamp_s,
+                )
+            else:
+                tracker.state = PeakState.SUSPECT
+                tracker.bad_count = max(
+                    tracker.bad_count,
+                    request.bad_samples_to_suspect,
+                )
+            return valid
+
+        def evaluate_quality(
+            tracker: PeakTracker,
+            other: PeakTracker,
+            measurement: PeakMeasurement,
+            error,
+        ) -> QualityResult:
+            hardware_valid = measurement.basic_valid()
+            error_valid = bool(error.valid) and abs(error.e_hz) <= (
+                request.maximum_error_fraction * tracker.model.error_linear_limit_hz
+            )
+            orthogonal_valid = bool(error.valid) and abs(error.q_hz) <= (
+                tracker.model.orthogonal_limit_hz
+            )
+            depth_observed = tracker.model.dc_baseline_at_center - measurement.dc
+            depth_valid = (
+                independent_dc
+                and depth_observed
+                >= request.minimum_depth_fraction * tracker.model.depth_reference
+            )
+            slope_recent = (
+                measurement.timestamp_s - tracker.last_slope_verification_s
+                <= request.slope_verification_max_age_s
+            )
+            identity_min_hz, identity_max_hz = identity_bounds(tracker, other)
+            identity_valid = (
+                identity_min_hz <= measurement.commanded_frequency_hz <= identity_max_hz
+                and (
+                    tracker.command_hz < other.command_hz
+                    if tracker.id == PeakId.LEFT
+                    else other.command_hz < tracker.command_hz
+                )
+            )
+            measurement_valid = hardware_valid and error.valid
+            good = (
+                measurement_valid
+                and error_valid
+                and orthogonal_valid
+                and identity_valid
+                and (depth_valid or slope_recent)
+            )
+            severe = not hardware_valid or not error.valid or not identity_valid
+            checks = [
+                measurement_valid,
+                error_valid,
+                orthogonal_valid,
+                identity_valid,
+                depth_valid or slope_recent,
+            ]
+            reasons: list[str] = []
+            if not measurement_valid:
+                reasons.append(error.reason or "measurement_invalid")
+            if not error_valid:
+                reasons.append("error_outside_linear_range")
+            if not orthogonal_valid:
+                reasons.append("orthogonal_residual_too_large")
+            if not identity_valid:
+                reasons.append("peak_identity_invalid")
+            if not (depth_valid or slope_recent):
+                reasons.append("peak_existence_not_verified")
+            return QualityResult(
+                measurement_valid=measurement_valid,
+                error_valid=error_valid,
+                depth_valid=depth_valid,
+                orthogonal_valid=orthogonal_valid,
+                slope_recent=slope_recent,
+                hardware_valid=hardware_valid,
+                identity_valid=identity_valid,
+                good=good,
+                severe_failure=severe,
+                score_0_to_1=sum(1.0 for value in checks if value) / len(checks),
+                reason=";".join(reasons),
+            )
+
+        def visit_peak(
+            tracker: PeakTracker,
+            other: PeakTracker,
+        ) -> dict[str, Any]:
+            tracker.visit_count += 1
+            if tracker.visit_count % request.verify_interval_visits == 0:
+                verify_live_slope(tracker)
+            measurement = acquire_at(tracker.id, tracker.command_hz)
+            error = calculate_frequency_error(
+                measurement,
+                tracker.model,
+                request.slope_epsilon,
+            )
+            quality = evaluate_quality(tracker, other, measurement, error)
+            tracker.last_error_hz = error.e_hz if error.valid else math.nan
+            tracker.last_q_hz = error.q_hz if error.valid else math.nan
+            tracker.last_quality = quality.score_0_to_1
+            tracker.last_measurement_valid = quality.measurement_valid
+            update_quality_state(
+                tracker,
+                quality,
+                bad_samples_to_suspect=request.bad_samples_to_suspect,
+                bad_samples_to_lose=request.bad_samples_to_lose,
+                good_samples_to_lock=request.good_samples_to_lock,
+            )
+            diagnostics: dict[str, Any] = {}
+            if quality.good and tracker.state in (PeakState.ACQUIRING, PeakState.LOCKED):
+                tracker.motion.update(
+                    error.center_measurement_hz,
+                    measurement.timestamp_s,
+                    request.velocity_filter_tau_s,
+                    request.maximum_velocity_hz_per_s,
+                    request.maximum_acceleration_hz_per_s2,
+                )
+                expected_next_dt_s = max(
+                    2.0 * self._measurement_settle_s(
+                        channel_index,
+                        request.tracking_settle_ms,
+                    ),
+                    1e-3,
+                )
+                base_hz = tracker.command_hz
+                if request.enable_velocity_prediction:
+                    base_hz += tracker.motion.velocity_hz_per_s * expected_next_dt_s
+                identity_min_hz, identity_max_hz = identity_bounds(tracker, other)
+                capture_half_hz = min(
+                    request.lock_error_limit_hz,
+                    tracker.model.error_linear_limit_hz,
+                )
+                predicted_center_hz = tracker.motion.center_hz
+                gain_scale = min(
+                    1.0,
+                    tracker.valid_samples_since_relock
+                    / max(1, request.relock_gain_ramp_samples),
+                )
+                tracker.command_hz, diagnostics = tracker.pid.update(
+                    command_hz=tracker.command_hz,
+                    error_hz=error.e_hz,
+                    timestamp_s=measurement.timestamp_s,
+                    base_hz=base_hz,
+                    capture_min_hz=max(
+                        request.start_hz,
+                        predicted_center_hz - capture_half_hz,
+                    ),
+                    capture_max_hz=min(
+                        request.stop_hz,
+                        predicted_center_hz + capture_half_hz,
+                    ),
+                    hardware_min_hz=request.start_hz,
+                    hardware_max_hz=request.stop_hz,
+                    identity_min_hz=identity_min_hz,
+                    identity_max_hz=identity_max_hz,
+                    quality_good=quality.good,
+                    integration_enabled=tracker.state
+                    in (PeakState.ACQUIRING, PeakState.LOCKED),
+                    gain_scale=gain_scale,
+                )
+                tracker.last_good_timestamp_s = measurement.timestamp_s
+                tracker.valid_samples_since_relock += 1
+                if tracker.pid.saturation_count >= request.saturation_loss_threshold:
+                    tracker.state = PeakState.LOCAL_REACQUIRE
+            return {
+                "peak_id": tracker.id.value,
+                "peak_state": tracker.state.value,
+                "timestamp_s": measurement.timestamp_s,
+                "commanded_frequency_hz": measurement.commanded_frequency_hz,
+                "x1": measurement.x1,
+                "y1": measurement.y1,
+                "dc": measurement.dc,
+                "e_hz": error.e_hz if math.isfinite(error.e_hz) else None,
+                "q_hz": error.q_hz if math.isfinite(error.q_hz) else None,
+                "center_measurement_hz": (
+                    error.center_measurement_hz
+                    if math.isfinite(error.center_measurement_hz)
+                    else None
+                ),
+                "quality": quality.score_0_to_1,
+                "quality_good": quality.good,
+                "quality_reason": quality.reason,
+                "pid": diagnostics,
+                "model_version": tracker.model.version,
+            }
+
+        def local_reacquire(tracker: PeakTracker, other: PeakTracker) -> bool:
+            nonlocal lost_lock_count
+            lost_lock_count += 1
+            tracker.state = PeakState.LOCAL_REACQUIRE
+            tracker.reacquire_attempts += 1
+            publish(
+                {
+                    "type": "current_tracking_local_reacquire",
+                    "peak_id": tracker.id.value,
+                    "stage": "start",
+                    "output_valid": False,
+                }
+            )
+            try:
+                predicted_hz, _, _ = tracker.motion.predict(
+                    clock(),
+                    max(
+                        request.maximum_extrapolation_age_s,
+                        request.slope_verification_max_age_s,
+                    ),
+                )
+            except ValueError:
+                predicted_hz = tracker.command_hz
+            for expansion in range(request.local_scan_max_expansions):
+                check_stopped()
+                identity_min_hz, identity_max_hz = identity_bounds(tracker, other)
+                half_width_hz = (
+                    request.local_scan_initial_width_fraction
+                    * tracker.model.fwhm_hz
+                    * request.local_scan_expansion_factor**expansion
+                )
+                scan_min_hz = max(identity_min_hz, predicted_hz - half_width_hz)
+                scan_max_hz = min(identity_max_hz, predicted_hz + half_width_hz)
+                if scan_max_hz <= scan_min_hz:
+                    continue
+                frequencies = np.linspace(
+                    scan_min_hz,
+                    scan_max_hz,
+                    request.local_scan_points,
+                )
+                measurements: list[PeakMeasurement] = []
+                for scan_index, frequency_hz in enumerate(frequencies):
+                    measurements.append(acquire_at(tracker.id, float(frequency_hz)))
+                    # 单峰局部扫描期间仍周期访问另一峰，避免其运动估计和锁定状态过期。
+                    if (scan_index + 1) % 2 == 0 and other.state in (
+                        PeakState.ACQUIRING,
+                        PeakState.LOCKED,
+                        PeakState.SUSPECT,
+                    ):
+                        visit_peak(other, tracker)
+                if not all(item.basic_valid() for item in measurements):
+                    continue
+                dc_values = [item.dc for item in measurements]
+                center_index = int(np.argmin(np.asarray(dc_values, dtype=float)))
+                center_hz = self._refine_extremum_frequency(
+                    frequencies,
+                    dc_values,
+                    center_index,
+                )
+                baseline = float(np.median(np.asarray(dc_values, dtype=float)))
+                dc_center = float(
+                    np.interp(center_hz, frequencies, np.asarray(dc_values, dtype=float))
+                )
+                depth = max(baseline - dc_center, 0.0)
+                if (
+                    independent_dc
+                    and depth
+                    < request.minimum_depth_fraction * tracker.model.depth_reference
+                ):
+                    continue
+                fwhm_hz = estimate_fwhm(
+                    frequencies.tolist(),
+                    dc_values,
+                    center_hz,
+                    baseline,
+                )
+                try:
+                    model, model_timestamp_s = calibrate_peak(
+                        peak_id=tracker.id,
+                        center_hz=center_hz,
+                        fwhm_hz=fwhm_hz,
+                        depth_reference=depth,
+                        dc_center_reference=dc_center,
+                        dc_baseline=baseline,
+                        band_min_hz=identity_min_hz,
+                        band_max_hz=identity_max_hz,
+                        version=tracker.model.version + 1,
+                    )
+                except Exception:
+                    continue
+                tracker.model = model
+                tracker.pid = make_pid(fwhm_hz)
+                tracker.command_hz = center_hz
+                tracker.motion = type(tracker.motion)()
+                tracker.motion.update(
+                    center_hz,
+                    model_timestamp_s,
+                    request.velocity_filter_tau_s,
+                    request.maximum_velocity_hz_per_s,
+                    request.maximum_acceleration_hz_per_s2,
+                )
+                tracker.last_slope_verification_s = model_timestamp_s
+                tracker.good_count = 0
+                tracker.bad_count = 0
+                tracker.valid_samples_since_relock = 0
+                tracker.state = PeakState.ACQUIRING
+                publish(
+                    {
+                        "type": "current_tracking_local_reacquire",
+                        "peak_id": tracker.id.value,
+                        "stage": "success",
+                        "expansion": expansion,
+                        "center_hz": center_hz,
+                        "model": model.as_dict(),
+                    }
+                )
+                return True
+            tracker.state = PeakState.LOST
+            publish(
+                {
+                    "type": "current_tracking_local_reacquire",
+                    "peak_id": tracker.id.value,
+                    "stage": "failed",
+                    "output_valid": False,
+                }
+            )
+            return False
+
+        def build_summary(status: str) -> dict[str, Any]:
+            return {
+                "status": status,
+                "global_state": global_state.value,
+                "started_at": started_wall_iso,
+                "ended_at": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_s": clock() - started_monotonic_s,
+                "cycles": cycle_index,
+                "relock_count": relock_count,
+                "lost_lock_count": lost_lock_count,
+                "last_point": last_point,
+                "dc_independent": independent_dc,
+            }
+
+        try:
+            if not self.prepare_microwave_fast_tracking():
+                raise RuntimeError(
+                    self.microwave_state.get("last_error") or "无法进入快速捷变频模式。"
+                )
+            publish(
+                {
+                    "type": "current_tracking_capability",
+                    "dc_independent": independent_dc,
+                    "live_slope_verification": True,
+                    "warning": (
+                        ""
+                        if independent_dc
+                        else "未配置独立 DC/峰存在性通道；当前以同通道 R 作为扫峰代理，并依靠周期复数斜率验证排除假锁。"
+                    ),
+                }
+            )
+            left, right = full_acquire("initial")
+            while not self.odmr_stop_event.is_set():
+                elapsed_s = clock() - started_monotonic_s
+                if (
+                    request.max_tracking_duration_s > 0
+                    and elapsed_s >= request.max_tracking_duration_s
+                ):
+                    break
+                visits: list[dict[str, Any]] = []
+                full_reacquire_needed = False
+                for tracker, other in ((left, right), (right, left)):
+                    check_stopped()
+                    if tracker.state == PeakState.LOCAL_REACQUIRE:
+                        if not local_reacquire(tracker, other):
+                            full_reacquire_needed = True
+                            break
+                    visits.append(visit_peak(tracker, other))
+                if full_reacquire_needed or left.state == PeakState.LOST or right.state == PeakState.LOST:
+                    relock_count += 1
+                    global_state = GlobalState.FULL_REACQUIRE
+                    invalid_event = {
+                        "type": "current_tracking_output",
+                        "output": {
+                            "timestamp_s": clock(),
+                            "valid": False,
+                            "invalid_reason": "full_reacquire",
+                            "left_state": left.state.value,
+                            "right_state": right.state.value,
+                        },
+                    }
+                    publish(invalid_event)
+                    if request.max_relock_attempts and relock_count > request.max_relock_attempts:
+                        raise RuntimeError("全频段重捕获次数超过配置上限。")
+                    if request.relock_cooldown_s > 0:
+                        time.sleep(request.relock_cooldown_s)
+                    left, right = full_acquire("peak_lost")
+                    continue
+
+                output = calculate_aligned_output(
+                    left=left,
+                    right=right,
+                    timestamp_s=clock(),
+                    maximum_extrapolation_age_s=request.maximum_extrapolation_age_s,
+                    maximum_delta_f_sigma_hz=request.maximum_delta_f_sigma_hz,
+                    delta_f_min_hz=request.delta_f_min_hz,
+                    delta_f_max_hz=request.delta_f_max_hz,
+                    calibration_slope_a_per_hz=request.minimum_calibration_slope_a_per_hz,
+                    calibration_intercept_a=request.minimum_calibration_intercept_a,
+                    calibration_min_hz=request.calibration_delta_f_min_hz,
+                    calibration_max_hz=request.calibration_delta_f_max_hz,
+                )
+                if (
+                    request.current_polarity_mode == "magnitude"
+                    and output.current_a is not None
+                ):
+                    output.current_a = abs(output.current_a)
+                cycle_index += 1
+                output_dict = output.as_dict()
+                display_left_hz = (
+                    output.f_left_hz
+                    if output.f_left_hz is not None
+                    else (left.motion.center_hz if left.motion.initialized else left.command_hz)
+                )
+                display_right_hz = (
+                    output.f_right_hz
+                    if output.f_right_hz is not None
+                    else (right.motion.center_hz if right.motion.initialized else right.command_hz)
+                )
+                display_delta_hz = (
+                    output.delta_f_hz
+                    if output.delta_f_hz is not None
+                    else display_right_hz - display_left_hz
+                )
+                last_point = {
+                    "timestamp": output.timestamp_s,
+                    "timestamp_s": output.timestamp_s,
+                    "elapsed_s": elapsed_s,
+                    "cycle_index": cycle_index,
+                    "tracking_target": "complex_projection",
+                    "readout_source": "complex_xy",
+                    "lock_state": "locked" if output.valid else "invalid",
+                    "valid": output.valid,
+                    "invalid_reason": output.invalid_reason,
+                    "left_frequency_hz": display_left_hz,
+                    "right_frequency_hz": display_right_hz,
+                    "splitting_hz": display_delta_hz,
+                    "common_mode_hz": output.common_mode_hz,
+                    "estimated_current_a": output.current_a,
+                    "delta_f_sigma_hz": output.delta_f_sigma_hz,
+                    "current_sigma_a": output.current_sigma_a,
+                    "left_state": left.state.value,
+                    "right_state": right.state.value,
+                    "left_quality": left.last_quality,
+                    "right_quality": right.last_quality,
+                    "left_error_hz": (
+                        left.last_error_hz if math.isfinite(left.last_error_hz) else None
+                    ),
+                    "right_error_hz": (
+                        right.last_error_hz if math.isfinite(right.last_error_hz) else None
+                    ),
+                    "left_q_hz": left.last_q_hz if math.isfinite(left.last_q_hz) else None,
+                    "right_q_hz": (
+                        right.last_q_hz if math.isfinite(right.last_q_hz) else None
+                    ),
+                    "left_setpoint_hz": left.command_hz,
+                    "right_setpoint_hz": right.command_hz,
+                    "left_pid": visits[0].get("pid", {}) if visits else {},
+                    "right_pid": visits[1].get("pid", {}) if len(visits) > 1 else {},
+                    "left_visit": visits[0] if visits else {},
+                    "right_visit": visits[1] if len(visits) > 1 else {},
+                    "relock_count": relock_count,
+                    "lost_lock_count": lost_lock_count,
+                    "global_state": global_state.value,
+                    "dc_independent": independent_dc,
+                }
+                self.measurement_state.update(
+                    {
+                        "mode": "current_tracking",
+                        "status": (
+                            "双峰已可靠锁定"
+                            if output.valid
+                            else f"输出无效: {output.invalid_reason}"
+                        ),
+                        "progress": (
+                            min(1.0, elapsed_s / request.max_tracking_duration_s)
+                            if request.max_tracking_duration_s > 0
+                            else 0.0
+                        ),
+                        "current_point": cycle_index,
+                        "current_frequency_hz": 0.5
+                        * (display_left_hz + display_right_hz),
+                        "current_value": display_delta_hz,
+                        "tracking": {
+                            "lock_state": last_point["lock_state"],
+                            "valid": output.valid,
+                            "invalid_reason": output.invalid_reason,
+                            "cycle_index": cycle_index,
+                            "left_frequency_hz": display_left_hz,
+                            "right_frequency_hz": display_right_hz,
+                            "splitting_hz": display_delta_hz,
+                            "estimated_current_a": output.current_a,
+                            "relock_count": relock_count,
+                            "lost_lock_count": lost_lock_count,
+                            "tracking_target": "complex_projection",
+                            "left_state": left.state.value,
+                            "right_state": right.state.value,
+                        },
+                    }
+                )
+                publish({"type": "current_tracking_output", "output": output_dict})
+                publish({"type": "current_tracking_point", "point": last_point})
+
+            global_state = (
+                GlobalState.STOPPED
+                if self.odmr_stop_event.is_set()
+                else GlobalState.TRACK
+            )
+            return build_summary(
+                "cancelled" if self.odmr_stop_event.is_set() else "completed"
+            )
+        except RuntimeError as exc:
+            if self.odmr_stop_event.is_set() and "已停止" in str(exc):
+                global_state = GlobalState.STOPPED
+                return build_summary("cancelled")
+            global_state = GlobalState.FAULT
+            raise
         finally:
             try:
                 if original_microwave_config:

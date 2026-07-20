@@ -2,7 +2,12 @@ import asyncio
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from backend.app.schemas.instruments import CurrentScanRequest, ODMRRequest, SensitivityRequest
+from backend.app.schemas.instruments import (
+    CurrentScanRequest,
+    CurrentTrackingRequest,
+    ODMRRequest,
+    SensitivityRequest,
+)
 from backend.app.services.instrument_manager import manager
 
 router = APIRouter(prefix="/api/measurement", tags=["measurement"])
@@ -211,3 +216,99 @@ async def current_ws(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         manager.measurement_state["running"] = False
         return
+
+
+@router.websocket("/current/tracking/ws")
+async def current_tracking_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    worker: asyncio.Task | None = None
+    request: CurrentTrackingRequest | None = None
+    try:
+        payload = await websocket.receive_json()
+        if manager.measurement_state.get("running"):
+            await websocket.send_json(
+                {
+                    "type": "current_tracking_error",
+                    "message": "已有测量任务正在运行，请先停止当前任务。",
+                }
+            )
+            return
+
+        request = CurrentTrackingRequest(**payload)
+        manager.begin_current_tracking(request)
+        await websocket.send_json(
+            {
+                "type": "current_tracking_started",
+                "channel_index": manager._resolve_measurement_channel_index(request.channel_index),
+                "requested_target": request.tracking_target,
+                "max_tracking_duration_s": request.max_tracking_duration_s,
+            }
+        )
+
+        event_queue: asyncio.Queue[dict] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def publish_event(event: dict) -> None:
+            loop.call_soon_threadsafe(event_queue.put_nowait, event)
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(manager.run_current_tracking, request, publish_event)
+        )
+        while not worker.done() or not event_queue.empty():
+            try:
+                event = await asyncio.wait_for(event_queue.get(), timeout=0.25)
+            except TimeoutError:
+                continue
+            await websocket.send_json(event)
+
+        result = await worker
+        status = str(result.get("status", "completed"))
+        manager.finish_current_tracking(request, result, status=status)
+        await websocket.send_json(
+            {
+                "type": (
+                    "current_tracking_cancelled"
+                    if status == "cancelled"
+                    else "current_tracking_complete"
+                ),
+                "result": result,
+            }
+        )
+    except WebSocketDisconnect:
+        result: dict | None = None
+        if worker is not None:
+            manager.cancel_odmr_stream()
+            try:
+                result = await asyncio.wait_for(asyncio.shield(worker), timeout=10.0)
+            except Exception:
+                pass
+        if request is not None and result is not None:
+            manager.finish_current_tracking(
+                request,
+                result,
+                status=str(result.get("status", "cancelled")),
+            )
+        elif request is not None and manager.measurement_state.get("mode") == "current_tracking":
+            manager.measurement_state["running"] = False
+            manager.measurement_state["mode"] = "idle"
+            manager.measurement_state["status"] = "cancelled"
+        return
+    except Exception as exc:
+        is_cancelled = "已停止" in str(exc)
+        manager.measurement_state["running"] = False
+        manager.measurement_state["mode"] = "idle"
+        manager.measurement_state["status"] = "cancelled" if is_cancelled else "error"
+        manager.measurement_state["cancel_requested"] = False
+        try:
+            await websocket.send_json(
+                {
+                    "type": (
+                        "current_tracking_cancelled"
+                        if is_cancelled
+                        else "current_tracking_error"
+                    ),
+                    "message": str(exc),
+                }
+            )
+        except Exception:
+            pass
