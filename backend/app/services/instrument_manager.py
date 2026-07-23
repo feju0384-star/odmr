@@ -11,6 +11,7 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 try:
@@ -60,6 +61,10 @@ from backend.app.services.dual_peak_tracker import (
     fit_complex_affine_model,
     select_fm_resonance_pair,
     update_quality_state,
+)
+from backend.app.services.tracking_runtime import TrackingTimingAnalyzer
+from backend.app.services.current_tracking_recorder import (
+    CurrentTrackingRecordingManager,
 )
 
 
@@ -213,6 +218,9 @@ class InstrumentManager:
         self.sampler_stop_event = threading.Event()
         self.odmr_stop_event = threading.Event()
         self.microwave_lock = threading.RLock()
+        self.current_tracking_recordings = CurrentTrackingRecordingManager(
+            Path(__file__).resolve().parents[3] / "data" / "current_tracking"
+        )
 
         self.lockin_state: dict[str, Any] = {
             "connected": False,
@@ -475,6 +483,43 @@ class InstrumentManager:
         channel_index = self._normalize_lockin_channel_index(channel_index)
         with self.device_lock:
             return self._read_lockin_sample(channel_index)
+
+    def read_lockin_sample_for_channel_timed(
+        self,
+        channel_index: int,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        """拆分设备锁等待和 Zurich 单点读取耗时，供跟踪瓶颈诊断。"""
+        channel_index = self._normalize_lockin_channel_index(channel_index)
+        clock = time.perf_counter
+        started_s = clock()
+        with self.device_lock:
+            acquired_s = clock()
+            sample = self._read_lockin_sample(channel_index)
+            completed_s = clock()
+        return sample, {
+            "lock_wait_ms": max(0.0, (acquired_s - started_s) * 1000.0),
+            "lockin_read_ms": max(0.0, (completed_s - acquired_s) * 1000.0),
+        }
+
+    def read_lockin_filter_runtime_diagnostics(
+        self,
+        channel_index: int,
+    ) -> dict[str, float | int]:
+        """只读 Zurich 当前 Demod 低通配置，用来发现 LabOne 与后端缓存不一致。"""
+        channel_index = self._normalize_lockin_channel_index(channel_index)
+        if self.lockin_device is None:
+            return {}
+        demod_index = self._demod_index_for_channel(channel_index)
+        with self.device_lock:
+            demod = self.lockin_device.demods[demod_index]
+            time_constant_s = float(demod.timeconstant())
+            order = int(demod.order())
+        return {
+            "demod_index": demod_index,
+            "time_constant_ms": time_constant_s * 1000.0,
+            "bandwidth_hz": self._bandwidth_hz(time_constant_s, order),
+            "filter_order": order,
+        }
 
     def _set_lockin_phase_deg(self, channel_index: int, phase_deg: float) -> float:
         channel_index = self._normalize_lockin_channel_index(channel_index)
@@ -2067,6 +2112,40 @@ class InstrumentManager:
     def begin_current_tracking(self, request: CurrentTrackingRequest) -> None:
         resolved_channel = self._resolve_measurement_channel_index(request.channel_index)
         self.odmr_stop_event.clear()
+        recording_state: dict[str, Any] = {
+            "status": "disabled",
+            "session_id": None,
+            "rows_written": 0,
+            "download_available": False,
+        }
+        if request.record_enabled:
+            recording_state = self.current_tracking_recordings.start(
+                interval_s=request.record_interval_s,
+                label=request.record_label,
+                request_snapshot={
+                    **request.model_dump(),
+                    "channel_index": resolved_channel,
+                },
+                device_snapshot={
+                    "lockin": {
+                        "serial": self.lockin_state.get("serial", ""),
+                        "name": self.lockin_state.get("name", ""),
+                        "interface": self.lockin_state.get("interface", ""),
+                        "channel": (
+                            dict(self.lockin_state.get("channels", [])[resolved_channel])
+                            if 0
+                            <= resolved_channel
+                            < len(self.lockin_state.get("channels", []))
+                            else {}
+                        ),
+                    },
+                    "microwave": {
+                        "address": self.microwave_state.get("address", ""),
+                        "idn": self.microwave_state.get("idn", ""),
+                        "config": dict(self.microwave_state.get("config", {})),
+                    },
+                },
+            )
         tracking_state = {
             "lock_state": "acquiring",
             "cycle_index": 0,
@@ -2076,6 +2155,7 @@ class InstrumentManager:
             "estimated_current_a": None,
             "relock_count": 0,
             "lost_lock_count": 0,
+            "recording": recording_state,
         }
         self.measurement_state.update(
             {
@@ -2102,10 +2182,22 @@ class InstrumentManager:
         result: dict[str, Any],
         status: str = "completed",
     ) -> dict[str, Any]:
+        recording_state = (
+            self.current_tracking_recordings.finish(status)
+            if request.record_enabled
+            else {
+                "status": "disabled",
+                "session_id": None,
+                "rows_written": 0,
+                "download_available": False,
+            }
+        )
+        result["recording"] = recording_state
         last_point = dict(result.get("last_point", {}) or {})
         tracking_state = {
             **dict(self.measurement_state.get("tracking", {}) or {}),
             "lock_state": "idle" if status in ("completed", "cancelled") else "error",
+            "recording": recording_state,
         }
         self.measurement_state.update(
             {
@@ -2129,6 +2221,24 @@ class InstrumentManager:
             }
         )
         return result
+
+    def finish_current_tracking_recording(
+        self,
+        status: str,
+    ) -> dict[str, Any] | None:
+        return self.current_tracking_recordings.finish(status)
+
+    def current_tracking_recording_status(
+        self,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.current_tracking_recordings.status(session_id)
+
+    def export_current_tracking_recording(
+        self,
+        session_id: str | None = None,
+    ) -> tuple[Path, dict[str, Any]]:
+        return self.current_tracking_recordings.export(session_id)
 
     def estimate_sensitivity_duration_s(self, request: SensitivityRequest) -> float:
         channel_index = self._resolve_measurement_channel_index(request.channel_index)
@@ -3303,6 +3413,19 @@ class InstrumentManager:
         relock_count = 0
         lost_lock_count = 0
         last_point: dict[str, Any] = {}
+        timing_analyzer = TrackingTimingAnalyzer()
+        latest_timing_snapshot: dict[str, Any] = {}
+        runtime_lockin_filter: dict[str, float | int] = {}
+        runtime_filter_reader = getattr(
+            self,
+            "read_lockin_filter_runtime_diagnostics",
+            None,
+        )
+        if callable(runtime_filter_reader) and hasattr(self, "device_lock"):
+            try:
+                runtime_lockin_filter = runtime_filter_reader(channel_index)
+            except Exception:
+                runtime_lockin_filter = {}
 
         def publish(payload: dict[str, Any]) -> None:
             if callable(event_callback):
@@ -3312,29 +3435,61 @@ class InstrumentManager:
             if self.odmr_stop_event.is_set():
                 raise RuntimeError("PID 双峰跟踪已停止。")
 
+        def read_channel_timed(
+            target_channel_index: int,
+        ) -> tuple[dict[str, float], dict[str, float]]:
+            timed_reader = getattr(
+                self,
+                "read_lockin_sample_for_channel_timed",
+                None,
+            )
+            if callable(timed_reader) and hasattr(self, "device_lock"):
+                return timed_reader(target_channel_index)
+            started_s = clock()
+            sample = self.read_lockin_sample_for_channel(target_channel_index)
+            return sample, {
+                "lock_wait_ms": 0.0,
+                "lockin_read_ms": max(0.0, (clock() - started_s) * 1000.0),
+            }
+
         def acquire_at(peak_id: PeakId, frequency_hz: float) -> PeakMeasurement:
+            acquisition_started_s = clock()
             check_stopped()
             if not math.isfinite(frequency_hz):
                 raise RuntimeError("频率命令包含 NaN/Inf。")
             if not request.start_hz <= frequency_hz <= request.stop_hz:
                 raise RuntimeError("频率命令越出硬件/跟踪范围。")
+            microwave_started_s = clock()
             if not self.set_microwave_frequency_fast(frequency_hz):
                 raise RuntimeError(
                     self.microwave_state.get("last_error") or "微波快速捷变频失败。"
                 )
-            time.sleep(self._measurement_settle_s(channel_index, request.tracking_settle_ms))
+            microwave_completed_s = clock()
+            settle_started_s = clock()
+            time.sleep(
+                self._measurement_settle_s(
+                    channel_index,
+                    request.tracking_settle_ms,
+                )
+            )
+            settle_completed_s = clock()
             x_blocks: list[float] = []
             y_blocks: list[float] = []
             dc_blocks: list[float] = []
+            lock_wait_ms = 0.0
+            lockin_read_ms = 0.0
             total_blocks = max(1, int(request.sample_averages))
             for _ in range(total_blocks):
                 check_stopped()
-                primary = self.read_lockin_sample_for_channel(channel_index)
-                dc_sample = (
-                    self.read_lockin_sample_for_channel(dc_channel_index)
-                    if independent_dc
-                    else primary
-                )
+                primary, primary_timing = read_channel_timed(channel_index)
+                lock_wait_ms += float(primary_timing.get("lock_wait_ms", 0.0))
+                lockin_read_ms += float(primary_timing.get("lockin_read_ms", 0.0))
+                if independent_dc:
+                    dc_sample, dc_timing = read_channel_timed(dc_channel_index)
+                    lock_wait_ms += float(dc_timing.get("lock_wait_ms", 0.0))
+                    lockin_read_ms += float(dc_timing.get("lockin_read_ms", 0.0))
+                else:
+                    dc_sample = primary
                 x_value = float(primary.get("x_v", math.nan))
                 y_value = float(primary.get("y_v", math.nan))
                 dc_value = float(dc_sample.get("r_v", math.nan))
@@ -3343,8 +3498,22 @@ class InstrumentManager:
                     y_blocks.append(y_value)
                     dc_blocks.append(dc_value)
             valid_blocks = min(len(x_blocks), len(y_blocks), len(dc_blocks))
+            completed_s = clock()
+            timing_analyzer.record_acquisition(
+                global_state.value,
+                {
+                    "total_ms": (completed_s - acquisition_started_s) * 1000.0,
+                    "microwave_command_ms": (
+                        microwave_completed_s - microwave_started_s
+                    )
+                    * 1000.0,
+                    "settle_ms": (settle_completed_s - settle_started_s) * 1000.0,
+                    "lock_wait_ms": lock_wait_ms,
+                    "lockin_read_ms": lockin_read_ms,
+                },
+            )
             return PeakMeasurement(
-                timestamp_s=clock(),
+                timestamp_s=completed_s,
                 commanded_frequency_hz=float(frequency_hz),
                 x1=float(statistics.median(x_blocks)) if x_blocks else math.nan,
                 y1=float(statistics.median(y_blocks)) if y_blocks else math.nan,
@@ -4018,6 +4187,7 @@ class InstrumentManager:
                 "lost_lock_count": lost_lock_count,
                 "last_point": last_point,
                 "dc_independent": independent_dc,
+                "timing": timing_analyzer.snapshot(),
             }
 
         try:
@@ -4039,6 +4209,7 @@ class InstrumentManager:
             )
             left, right = full_acquire("initial")
             while not self.odmr_stop_event.is_set():
+                cycle_started_s = clock()
                 elapsed_s = clock() - started_monotonic_s
                 if (
                     request.max_tracking_duration_s > 0
@@ -4094,6 +4265,83 @@ class InstrumentManager:
                 ):
                     output.current_a = abs(output.current_a)
                 cycle_index += 1
+                timing_analyzer.record_cycle(clock() - cycle_started_s)
+                if (
+                    cycle_index == 1
+                    or cycle_index % request.timing_report_interval_cycles == 0
+                ):
+                    latest_timing_snapshot = timing_analyzer.snapshot()
+                    channel_state = (
+                        self.lockin_state.get("channels", [])[channel_index]
+                        if 0
+                        <= channel_index
+                        < len(self.lockin_state.get("channels", []))
+                        else {}
+                    )
+                    cached_time_constant_ms = channel_state.get("time_constant_ms")
+                    device_time_constant_ms = runtime_lockin_filter.get(
+                        "time_constant_ms"
+                    )
+                    filter_cache_mismatch = (
+                        isinstance(cached_time_constant_ms, (int, float))
+                        and isinstance(device_time_constant_ms, (int, float))
+                        and abs(
+                            float(cached_time_constant_ms)
+                            - float(device_time_constant_ms)
+                        )
+                        > max(0.05, 0.05 * abs(float(device_time_constant_ms)))
+                    )
+                    timing_event = {
+                        "type": "current_tracking_timing",
+                        "timing": {
+                            **latest_timing_snapshot,
+                            "tracking_channel_index": channel_index,
+                            "demod_index": channel_state.get("demod_index"),
+                            "lockin_time_constant_ms": channel_state.get(
+                                "time_constant_ms"
+                            ),
+                            "lockin_bandwidth_hz": channel_state.get(
+                                "low_pass_bandwidth_hz"
+                            ),
+                            "lockin_filter_order": channel_state.get(
+                                "low_pass_order"
+                            ),
+                            "device_time_constant_ms": device_time_constant_ms,
+                            "device_bandwidth_hz": runtime_lockin_filter.get(
+                                "bandwidth_hz"
+                            ),
+                            "device_filter_order": runtime_lockin_filter.get(
+                                "filter_order"
+                            ),
+                            "filter_cache_mismatch": filter_cache_mismatch,
+                            "configured_tracking_settle_ms": (
+                                request.tracking_settle_ms
+                            ),
+                            "effective_settle_ms": self._measurement_settle_s(
+                                channel_index,
+                                request.tracking_settle_ms,
+                            )
+                            * 1000.0,
+                            "background_sampler_running": bool(
+                                getattr(self, "sampler_thread", None)
+                                and getattr(self.sampler_thread, "is_alive", lambda: False)()
+                            ),
+                            "background_poll_recording_ms": float(
+                                getattr(self, "sampling_interval_connected", 0.0)
+                            )
+                            * 1000.0,
+                            "background_poll_timeout_ms": float(
+                                getattr(self, "sampling_timeout_connected", 0.0)
+                            )
+                            * 1000.0,
+                            "microwave_idn": self.microwave_state.get("idn", ""),
+                            "microwave_address": self.microwave_state.get(
+                                "address", ""
+                            ),
+                            "microwave_control_mode": "cw_scpi_freq_write",
+                        },
+                    }
+                    publish(timing_event)
                 output_dict = output.as_dict()
                 display_left_hz = (
                     output.f_left_hz
@@ -4151,7 +4399,32 @@ class InstrumentManager:
                     "lost_lock_count": lost_lock_count,
                     "global_state": global_state.value,
                     "dc_independent": independent_dc,
+                    "timing": latest_timing_snapshot,
                 }
+                recorder_manager = getattr(
+                    self,
+                    "current_tracking_recordings",
+                    None,
+                )
+                recording_status = None
+                if request.record_enabled and recorder_manager is not None:
+                    try:
+                        wrote_record, recording_status = (
+                            recorder_manager.record_point(last_point)
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"连续跟踪数据写盘失败，为防止长时实验无记录已停止: {exc}"
+                        ) from exc
+                    if recording_status is not None:
+                        last_point["recording"] = recording_status
+                        if wrote_record:
+                            publish(
+                                {
+                                    "type": "current_tracking_recording",
+                                    "recording": recording_status,
+                                }
+                            )
                 self.measurement_state.update(
                     {
                         "mode": "current_tracking",
@@ -4183,6 +4456,12 @@ class InstrumentManager:
                             "tracking_target": "complex_projection",
                             "left_state": left.state.value,
                             "right_state": right.state.value,
+                            "recording": (
+                                recording_status
+                                or dict(
+                                    self.measurement_state.get("tracking", {}) or {}
+                                ).get("recording")
+                            ),
                         },
                     }
                 )

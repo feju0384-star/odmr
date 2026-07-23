@@ -8,7 +8,9 @@ import {
   Select,
   SimpleGrid,
   Stack,
+  Switch,
   Text,
+  TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 
@@ -25,6 +27,10 @@ const DEFAULT_TRACKING_FORM = {
   probe_offset_hz: 250_000,
   tracking_settle_ms: 3,
   sample_averages: 1,
+  timing_report_interval_cycles: 10,
+  record_enabled: true,
+  record_interval_s: 1,
+  record_label: "",
   kp: 0.45,
   ki_per_s: 0.03,
   kd_s: 0,
@@ -160,6 +166,22 @@ function lockColor(state) {
   return "gray";
 }
 
+function timingBottleneckLabel(value) {
+  const labels = {
+    microwave_command_ms: "微波 SCPI 写频",
+    settle_ms: "稳定等待",
+    lock_wait_ms: "Zurich 设备锁等待",
+    lockin_read_ms: "Zurich 单点读取",
+    other_ms: "计算/调度/其他",
+  };
+  return labels[value] || "等待诊断";
+}
+
+function formatMs(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `${numeric.toFixed(2)} ms` : "--";
+}
+
 export function CurrentTrackingPanel({
   currentForm,
   calibrationPoints,
@@ -180,6 +202,9 @@ export function CurrentTrackingPanel({
   const [capabilityWarning, setCapabilityWarning] = useState("");
   const [dcIndependent, setDcIndependent] = useState(false);
   const [knownCurrentA, setKnownCurrentA] = useState(null);
+  const [timingDiagnostics, setTimingDiagnostics] = useState(null);
+  const [recordingStatus, setRecordingStatus] = useState(null);
+  const [isDownloadingRecording, setIsDownloadingRecording] = useState(false);
   const socketRef = useRef(null);
 
   useEffect(
@@ -189,6 +214,22 @@ export function CurrentTrackingPanel({
     },
     []
   );
+
+  useEffect(() => {
+    let active = true;
+    api.currentTrackingRecordingStatus()
+      .then((result) => {
+        if (active && result?.data?.session_id) {
+          setRecordingStatus(result.data);
+        }
+      })
+      .catch(() => {
+        // 没有历史记录或后端尚未启动时保持空状态。
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const updateNumber = (field, minimum = 0) => (value) => {
     setForm((previous) => ({
@@ -253,6 +294,8 @@ export function CurrentTrackingPanel({
     setRelockCount(0);
     setWarningReasons([]);
     setCapabilityWarning("");
+    setTimingDiagnostics(null);
+    setRecordingStatus(null);
     setLockState("connecting");
     setStatusText("正在连接跟踪通道");
     const socket = new WebSocket(wsUrl("/measurement/current/tracking/ws"));
@@ -283,6 +326,7 @@ export function CurrentTrackingPanel({
         const payload = JSON.parse(event.data);
         if (payload.type === "current_tracking_started") {
           setLockState("acquiring");
+          setRecordingStatus(payload.recording || null);
           setStatusText("正在初始扫描并捕获左右共振峰");
         } else if (payload.type === "current_tracking_capability") {
           const warning = payload.warning || "";
@@ -326,6 +370,10 @@ export function CurrentTrackingPanel({
             setLockState("warning");
             setStatusText(`${payload.peak_id === "left" ? "左峰" : "右峰"}实时复数斜率验证失败`);
           }
+        } else if (payload.type === "current_tracking_timing") {
+          setTimingDiagnostics(payload.timing || null);
+        } else if (payload.type === "current_tracking_recording") {
+          setRecordingStatus(payload.recording || null);
         } else if (payload.type === "current_tracking_acquiring") {
           setLockState(payload.reason === "initial" ? "acquiring" : "relocking");
           setStatusText(payload.reason === "initial" ? "正在扫描双峰" : "失锁后正在重新扫峰");
@@ -387,6 +435,7 @@ export function CurrentTrackingPanel({
         ) {
           setIsTracking(false);
           setLockState("stopped");
+          setRecordingStatus(payload.result?.recording || recordingStatus);
           setStatusText(
             payload.type === "current_tracking_cancelled" ? "跟踪已停止" : "跟踪时长结束"
           );
@@ -417,6 +466,9 @@ export function CurrentTrackingPanel({
         setIsTracking(false);
         setLockState("error");
         setStatusText("跟踪连接意外断开");
+        api.currentTrackingRecordingStatus()
+          .then((result) => setRecordingStatus(result?.data || null))
+          .catch(() => {});
       }
     };
   };
@@ -431,6 +483,40 @@ export function CurrentTrackingPanel({
         title: "停止失败",
         message: error instanceof Error ? error.message : "未知错误",
       });
+    }
+  };
+
+  const downloadRecording = async () => {
+    try {
+      setIsDownloadingRecording(true);
+      const result = await api.downloadCurrentTrackingRecording(
+        recordingStatus?.session_id || ""
+      );
+      const url = URL.createObjectURL(result.blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = result.filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      const statusResult = await api.currentTrackingRecordingStatus(
+        recordingStatus?.session_id || ""
+      );
+      setRecordingStatus(statusResult?.data || recordingStatus);
+      notifications.show({
+        color: "teal",
+        title: "Excel 已生成",
+        message: "下载内容是截至当前时刻的 1 秒聚合数据快照。",
+      });
+    } catch (error) {
+      notifications.show({
+        color: "red",
+        title: "导出失败",
+        message: error instanceof Error ? error.message : "未知错误",
+      });
+    } finally {
+      setIsDownloadingRecording(false);
     }
   };
 
@@ -546,6 +632,21 @@ export function CurrentTrackingPanel({
             setForm((previous) => ({
               ...previous,
               sample_averages: Math.max(1, Math.round(numberOr(value, previous.sample_averages))),
+            }))
+          }
+        />
+        <NumberInput
+          label="耗时分析报告间隔 (周期)"
+          value={form.timing_report_interval_cycles}
+          disabled={isTracking}
+          min={1}
+          onChange={(value) =>
+            setForm((previous) => ({
+              ...previous,
+              timing_report_interval_cycles: Math.max(
+                1,
+                Math.round(numberOr(value, previous.timing_report_interval_cycles))
+              ),
             }))
           }
         />
@@ -698,6 +799,45 @@ export function CurrentTrackingPanel({
         />
       </SimpleGrid>
 
+      <SimpleGrid cols={{ base: 1, md: 3 }} mt="lg">
+        <Switch
+          label="保存长期电流数据"
+          description="后台每秒聚合，CSV 增量落盘并可导出 Excel"
+          checked={form.record_enabled}
+          disabled={isTracking}
+          onChange={(event) =>
+            setForm((previous) => ({
+              ...previous,
+              record_enabled: event.currentTarget.checked,
+            }))
+          }
+        />
+        <NumberInput
+          label="保存间隔 (s)"
+          description="13 小时建议保持 1 s"
+          value={form.record_interval_s}
+          disabled={isTracking || !form.record_enabled}
+          min={0.1}
+          max={3600}
+          decimalScale={1}
+          onChange={updateNumber("record_interval_s", 0.1)}
+        />
+        <TextInput
+          label="实验标签"
+          description="会写入文件名和参数表"
+          value={form.record_label}
+          disabled={isTracking || !form.record_enabled}
+          maxLength={80}
+          placeholder="例如 coil_2A_13h"
+          onChange={(event) =>
+            setForm((previous) => ({
+              ...previous,
+              record_label: event.currentTarget.value,
+            }))
+          }
+        />
+      </SimpleGrid>
+
       <Group mt="lg">
         <Button
           color="cyan"
@@ -710,6 +850,23 @@ export function CurrentTrackingPanel({
         <Button color="red" variant="light" onClick={stopTracking} disabled={!isTracking}>
           停止连续跟踪
         </Button>
+        <Button
+          variant="light"
+          color="blue"
+          onClick={downloadRecording}
+          loading={isDownloadingRecording}
+          disabled={!recordingStatus?.download_available}
+        >
+          下载 Excel 快照
+        </Button>
+        {form.record_enabled || recordingStatus?.session_id ? (
+          <Badge
+            variant="light"
+            color={recordingStatus?.status === "recording" ? "teal" : "gray"}
+          >
+            已保存 {numberOr(recordingStatus?.rows_written, 0)} 点
+          </Badge>
+        ) : null}
         <Badge variant="light" color={minimumCalibration ? "teal" : "gray"}>
           物理峰心标定 {minimumCalibration?.point_count || 0} 点
         </Badge>
@@ -799,6 +956,66 @@ export function CurrentTrackingPanel({
           label="右积分状态"
           value={formatKHz(rightPid.i_hz)}
           hint={rightPid.saturated ? "混合抗饱和生效" : `q ${formatKHz(latestPoint?.right_q_hz)}`}
+        />
+      </SimpleGrid>
+
+      <Text fw={600} mt="lg">跟踪时间瓶颈分析</Text>
+      <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }} mt="xs">
+        <MetricCard
+          label="自动判定瓶颈"
+          value={timingBottleneckLabel(timingDiagnostics?.bottleneck)}
+          hint={
+            Number.isFinite(Number(timingDiagnostics?.stage_share?.[timingDiagnostics?.bottleneck]))
+              ? `占采集时间 ${(Number(timingDiagnostics.stage_share[timingDiagnostics.bottleneck]) * 100).toFixed(1)}%`
+              : "累计首个闭环周期后开始分析"
+          }
+        />
+        <MetricCard
+          label="实测双峰更新率"
+          value={
+            Number.isFinite(Number(timingDiagnostics?.measured_update_rate_hz))
+              ? `${Number(timingDiagnostics.measured_update_rate_hz).toFixed(2)} Hz`
+              : "--"
+          }
+          hint={`周期 P50 ${formatMs(timingDiagnostics?.cycle_median_ms)} / P95 ${formatMs(timingDiagnostics?.cycle_p95_ms)}`}
+        />
+        <MetricCard
+          label="微波 SCPI 写频"
+          value={formatMs(timingDiagnostics?.stage_mean_ms?.microwave_command_ms)}
+          hint="每个频点的 VISA resource.write 耗时"
+        />
+        <MetricCard
+          label="显式稳定等待"
+          value={formatMs(timingDiagnostics?.stage_mean_ms?.settle_ms)}
+          hint={`配置 ${formatMs(timingDiagnostics?.configured_tracking_settle_ms)} / 实际下限 ${formatMs(timingDiagnostics?.effective_settle_ms)}`}
+        />
+        <MetricCard
+          label="Zurich 设备锁等待"
+          value={formatMs(timingDiagnostics?.stage_mean_ms?.lock_wait_ms)}
+          hint={
+            timingDiagnostics?.background_sampler_running
+              ? `后台 poll 开启，记录窗 ${formatMs(timingDiagnostics?.background_poll_recording_ms)}`
+              : "后台 poll 未运行"
+          }
+        />
+        <MetricCard
+          label="Zurich 单点读取"
+          value={formatMs(timingDiagnostics?.stage_mean_ms?.lockin_read_ms)}
+          hint="demod.sample() 调用耗时"
+        />
+        <MetricCard
+          label="单频点采集"
+          value={formatMs(timingDiagnostics?.acquisition_median_ms)}
+          hint={`P95 ${formatMs(timingDiagnostics?.acquisition_p95_ms)}`}
+        />
+        <MetricCard
+          label="实际锁相配置"
+          value={
+            Number.isFinite(Number(timingDiagnostics?.device_bandwidth_hz ?? timingDiagnostics?.lockin_bandwidth_hz))
+              ? `${Number(timingDiagnostics?.device_bandwidth_hz ?? timingDiagnostics?.lockin_bandwidth_hz).toFixed(2)} Hz`
+              : "--"
+          }
+          hint={`Demod ${timingDiagnostics?.demod_index ?? "--"} / τ ${formatMs(timingDiagnostics?.device_time_constant_ms ?? timingDiagnostics?.lockin_time_constant_ms)} / ${timingDiagnostics?.device_filter_order ?? timingDiagnostics?.lockin_filter_order ?? "--"} 阶${timingDiagnostics?.filter_cache_mismatch ? "；后端缓存不一致" : ""}`}
         />
       </SimpleGrid>
 

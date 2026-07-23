@@ -1,0 +1,8 @@
+fastapi>=0.115
+numpy>=1.26
+openpyxl>=3.1
+pydantic>=2.7
+pyvisa>=1.14
+pyvisa-py>=0.7
+uvicorn[standard]>=0.30
+zhinst-toolkit>=0.7

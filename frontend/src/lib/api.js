@@ -18,6 +18,23 @@ async function request(path, options = {}) {
   return response.json();
 }
 
+async function downloadRequest(path) {
+  const response = await fetch(`${API_BASE}${path}`);
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `Request failed: ${response.status}`);
+  }
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const plainName = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+  return {
+    blob: await response.blob(),
+    filename: encodedName
+      ? decodeURIComponent(encodedName)
+      : plainName || "current_tracking.xlsx",
+  };
+}
+
 export const api = {
   dashboard: () => request("/instruments/dashboard"),
   discoverLockins: (params) => {
@@ -74,6 +91,20 @@ export const api = {
     request("/measurement/current/stop", {
       method: "POST",
     }),
+  currentTrackingRecordingStatus: (sessionId = "") => {
+    const query = sessionId
+      ? `?session_id=${encodeURIComponent(sessionId)}`
+      : "";
+    return request(`/measurement/current/tracking/recording/status${query}`);
+  },
+  downloadCurrentTrackingRecording: (sessionId = "") => {
+    const query = sessionId
+      ? `?session_id=${encodeURIComponent(sessionId)}`
+      : "";
+    return downloadRequest(
+      `/measurement/current/tracking/recording/download${query}`
+    );
+  },
 };
 
 export function wsUrl(path) {

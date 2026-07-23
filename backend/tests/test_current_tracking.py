@@ -15,6 +15,8 @@ class CurrentTrackingRequestTests(unittest.TestCase):
         request = CurrentTrackingRequest()
         self.assertEqual(request.tracking_target, "complex_projection")
         self.assertGreater(request.verify_interval_visits, 0)
+        self.assertTrue(request.record_enabled)
+        self.assertEqual(request.record_interval_s, 1.0)
 
     def test_legacy_r_or_zero_crossing_target_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
@@ -71,8 +73,11 @@ class HardwareLoopSimulationTests(unittest.TestCase):
 
         manager.read_lockin_sample_for_channel = read_channel
         points = []
+        timing_events = []
 
         def on_event(event):
+            if event.get("type") == "current_tracking_timing":
+                timing_events.append(event["timing"])
             if event.get("type") == "current_tracking_point":
                 points.append(event["point"])
                 if len(points) >= 5:
@@ -102,6 +107,9 @@ class HardwareLoopSimulationTests(unittest.TestCase):
         result = manager.run_current_tracking(request, on_event)
         self.assertEqual(result["status"], "cancelled")
         self.assertEqual(len(points), 5)
+        self.assertTrue(timing_events)
+        self.assertIn("bottleneck", timing_events[-1])
+        self.assertGreaterEqual(timing_events[-1]["measured_update_rate_hz"], 0.0)
         valid_points = [point for point in points if point["valid"]]
         self.assertTrue(valid_points)
         self.assertAlmostEqual(

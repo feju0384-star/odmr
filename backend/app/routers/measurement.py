@@ -1,6 +1,7 @@
 import asyncio
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 
 from backend.app.schemas.instruments import (
     CurrentScanRequest,
@@ -31,6 +32,41 @@ async def stop_sensitivity() -> dict:
 @router.post("/current/stop")
 async def stop_current() -> dict:
     return manager.cancel_odmr_stream()
+
+
+@router.get("/current/tracking/recording/status")
+async def current_tracking_recording_status(
+    session_id: str | None = Query(default=None),
+) -> dict:
+    return {
+        "success": True,
+        "data": manager.current_tracking_recording_status(session_id),
+    }
+
+
+@router.get("/current/tracking/recording/download")
+async def download_current_tracking_recording(
+    session_id: str | None = Query(default=None),
+) -> FileResponse:
+    try:
+        path, _ = await asyncio.to_thread(
+            manager.export_current_tracking_recording,
+            session_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Excel 导出失败: {exc}") from exc
+    return FileResponse(
+        path=path,
+        filename=path.name,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.websocket("/odmr/ws")
@@ -242,6 +278,7 @@ async def current_tracking_ws(websocket: WebSocket) -> None:
                 "channel_index": manager._resolve_measurement_channel_index(request.channel_index),
                 "requested_target": request.tracking_target,
                 "max_tracking_duration_s": request.max_tracking_duration_s,
+                "recording": manager.current_tracking_recording_status(),
             }
         )
 
@@ -289,12 +326,17 @@ async def current_tracking_ws(websocket: WebSocket) -> None:
                 status=str(result.get("status", "cancelled")),
             )
         elif request is not None and manager.measurement_state.get("mode") == "current_tracking":
+            manager.finish_current_tracking_recording("cancelled")
             manager.measurement_state["running"] = False
             manager.measurement_state["mode"] = "idle"
             manager.measurement_state["status"] = "cancelled"
         return
     except Exception as exc:
         is_cancelled = "已停止" in str(exc)
+        if request is not None:
+            manager.finish_current_tracking_recording(
+                "cancelled" if is_cancelled else "error"
+            )
         manager.measurement_state["running"] = False
         manager.measurement_state["mode"] = "idle"
         manager.measurement_state["status"] = "cancelled" if is_cancelled else "error"

@@ -124,6 +124,10 @@ class CurrentTrackingRequest(BaseModel):
     probe_offset_hz: float = Field(default=250_000.0, gt=0.0)
     tracking_settle_ms: float = Field(default=3.0, ge=0.1, le=5000.0)
     sample_averages: int = Field(default=1, ge=1, le=100)
+    timing_report_interval_cycles: int = Field(default=10, ge=1, le=10000)
+    record_enabled: bool = True
+    record_interval_s: float = Field(default=1.0, ge=0.1, le=3600.0)
+    record_label: str = Field(default="", max_length=80)
     kp: float = Field(default=0.45, ge=0.0, le=100.0)
     ki_per_s: float = Field(default=0.03, ge=0.0, le=1000.0)
     kd_s: float = Field(default=0.0, ge=0.0, le=1000.0)
