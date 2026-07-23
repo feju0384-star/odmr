@@ -91,6 +91,10 @@ export const api = {
     request("/measurement/current/stop", {
       method: "POST",
     }),
+  stopStateEstimationCurrent: () =>
+    request("/state-estimation-current/stop", {
+      method: "POST",
+    }),
   currentTrackingRecordingStatus: (sessionId = "") => {
     const query = sessionId
       ? `?session_id=${encodeURIComponent(sessionId)}`

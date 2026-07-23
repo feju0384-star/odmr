@@ -18,6 +18,7 @@ import {
   IconChartLine,
   IconCpu,
   IconCurrentLocation,
+  IconTopologyStar3,
 } from "@tabler/icons-react";
 import { useLocation, useNavigate } from "react-router-dom";
 
@@ -27,6 +28,7 @@ const navItems = [
   { to: "/microwave", label: "微波设置", subtitle: "CW / Sweep / FM", icon: IconAntennaBars5 },
   { to: "/odmr", label: "ODMR 扫描", subtitle: "两种扫描方式", icon: IconChartLine },
   { to: "/current", label: "电流测量", subtitle: "标定与自动测量", icon: IconCurrentLocation },
+  { to: "/state-estimation", label: "状态估计电流", subtitle: "EKF / UKF 双峰预测", icon: IconTopologyStar3 },
 ];
 
 function Sidebar({ onNavigate }) {
@@ -89,7 +91,7 @@ function Sidebar({ onNavigate }) {
             </Text>
           </div>
           <Badge variant="light" color="cyan" size="lg">
-            5 Pages
+            6 Pages
           </Badge>
         </Group>
       </Box>

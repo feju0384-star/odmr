@@ -11,6 +11,7 @@ if __package__ in (None, ""):
 from backend.app.core.config import settings
 from backend.app.routers.instruments import router as instrument_router
 from backend.app.routers.measurement import router as measurement_router
+from backend.app.routers.state_estimation import router as state_estimation_router
 from backend.app.routers.system import router as system_router
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
@@ -26,6 +27,7 @@ app.add_middleware(
 app.include_router(system_router)
 app.include_router(instrument_router)
 app.include_router(measurement_router)
+app.include_router(state_estimation_router)
 
 
 @app.get("/")

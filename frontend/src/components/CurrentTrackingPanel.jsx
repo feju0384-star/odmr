@@ -5,7 +5,6 @@ import {
   Grid,
   Group,
   NumberInput,
-  Select,
   SimpleGrid,
   Stack,
   Switch,
@@ -184,6 +183,9 @@ function formatMs(value) {
 
 export function CurrentTrackingPanel({
   currentForm,
+  onCurrentFormChange,
+  onSyncFromOdmr,
+  onUseDefaultResonance,
   calibrationPoints,
   onAddPhysicalCalibrationPoint,
   lockinConnected,
@@ -486,6 +488,21 @@ export function CurrentTrackingPanel({
     }
   };
 
+  const updateCurrentNumber = (field, minimum = null, integer = false) => (value) => {
+    const previousValue = currentForm?.[field];
+    let numeric = numberOr(value, previousValue);
+    if (integer) {
+      numeric = Math.round(numeric);
+    }
+    if (minimum !== null) {
+      numeric = Math.max(minimum, numeric);
+    }
+    onCurrentFormChange?.({
+      ...currentForm,
+      [field]: numeric,
+    });
+  };
+
   const downloadRecording = async () => {
     try {
       setIsDownloadingRecording(true);
@@ -587,14 +604,40 @@ export function CurrentTrackingPanel({
         <Text c="yellow" size="sm" mb="md">{capabilityWarning}</Text>
       ) : null}
 
+      <Text fw={600} mb="xs">初始双峰捕获范围</Text>
       <SimpleGrid cols={{ base: 1, md: 2, xl: 4 }}>
-        <Select
-          label="鉴频算法"
-          value={form.tracking_target}
-          disabled
-          data={[
-            { value: "complex_projection", label: "FM R 双瓣谷 + X/Y 复数投影" },
-          ]}
+        <NumberInput
+          label="锁相通道"
+          value={currentForm.channel_index}
+          disabled={isTracking}
+          min={0}
+          onChange={updateCurrentNumber("channel_index", 0, true)}
+        />
+        <NumberInput
+          label="起始频率 (Hz)"
+          value={currentForm.start_hz}
+          disabled={isTracking}
+          onChange={updateCurrentNumber("start_hz")}
+        />
+        <NumberInput
+          label="终止频率 (Hz)"
+          value={currentForm.stop_hz}
+          disabled={isTracking}
+          onChange={updateCurrentNumber("stop_hz")}
+        />
+        <NumberInput
+          label="搜索点数"
+          value={currentForm.search_points}
+          disabled={isTracking}
+          min={11}
+          onChange={updateCurrentNumber("search_points", 11, true)}
+        />
+        <NumberInput
+          label="初始扫频稳定等待 (ms)"
+          value={currentForm.settle_ms}
+          disabled={isTracking}
+          min={0.1}
+          onChange={updateCurrentNumber("settle_ms", 0.1)}
         />
         <NumberInput
           label="独立 DC/峰存在性通道 (-1=未配置)"
@@ -798,6 +841,28 @@ export function CurrentTrackingPanel({
           onChange={updateNumber("max_tracking_duration_s")}
         />
       </SimpleGrid>
+
+      <Group mt="md">
+        <Button
+          variant="light"
+          color="gray"
+          onClick={onSyncFromOdmr}
+          disabled={isTracking}
+        >
+          继承 ODMR 扫频范围
+        </Button>
+        <Button
+          variant="light"
+          color="gray"
+          onClick={onUseDefaultResonance}
+          disabled={isTracking}
+        >
+          回到 2.87 GHz 默认范围
+        </Button>
+        <Text c="dimmed" size="sm">
+          局部重扫会自动扩大，但不会超过这里设置的起止频率。
+        </Text>
+      </Group>
 
       <SimpleGrid cols={{ base: 1, md: 3 }} mt="lg">
         <Switch
