@@ -63,9 +63,6 @@ class HardwareLoopSimulationTests(unittest.TestCase):
             )
             peak_id = PeakId.LEFT if current_frequency_hz < midpoint_hz else PeakId.RIGHT
             z1 = simulator.z1(peak_id, current_frequency_hz, 0.0)
-            dc = simulator.dc(current_frequency_hz, 0.0)
-            if channel_index == 1:
-                return {"x_v": dc, "y_v": 0.0, "r_v": dc}
             return {
                 "x_v": z1.real,
                 "y_v": z1.imag,
@@ -83,7 +80,7 @@ class HardwareLoopSimulationTests(unittest.TestCase):
 
         request = CurrentTrackingRequest(
             channel_index=0,
-            independent_dc_channel_index=1,
+            independent_dc_channel_index=-1,
             start_hz=2.858e9,
             stop_hz=2.882e9,
             search_points=121,

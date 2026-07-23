@@ -11,9 +11,12 @@ from backend.app.services.dual_peak_tracker import (
     PeakTracker,
     QualityResult,
     SpecPidController,
+    blend_symmetric_complex_probe,
     calculate_aligned_output,
     calculate_frequency_error,
+    find_fm_magnitude_resonances,
     fit_complex_affine_model,
+    select_fm_resonance_pair,
     update_quality_state,
 )
 
@@ -114,6 +117,82 @@ class ComplexProjectionTests(unittest.TestCase):
         result = calculate_frequency_error(measurement, model, 1e-20)
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, "slope_too_small")
+
+    def test_live_symmetric_probe_updates_intercept_and_slope(self) -> None:
+        model = make_model(1000.0, complex(2e-6, -1e-6))
+        old_b = model.b
+        b_live = complex(0.35, -0.22)
+        g_live = complex(3e-6, 4e-6)
+        delta_hz = 25.0
+        returned_b, returned_g = blend_symmetric_complex_probe(
+            model,
+            center_hz=1010.0,
+            minus_z=b_live - g_live * delta_hz,
+            plus_z=b_live + g_live * delta_hz,
+            delta_hz=delta_hz,
+            blend_fraction=0.2,
+        )
+        self.assertAlmostEqual(returned_b.real, b_live.real)
+        self.assertAlmostEqual(returned_b.imag, b_live.imag)
+        self.assertAlmostEqual(returned_g.real, g_live.real)
+        self.assertAlmostEqual(returned_g.imag, g_live.imag)
+        expected_b = 0.8 * old_b + 0.2 * b_live
+        expected_g = 0.8 * complex(2e-6, -1e-6) + 0.2 * g_live
+        self.assertAlmostEqual(model.b.real, expected_b.real)
+        self.assertAlmostEqual(model.b.imag, expected_b.imag)
+        self.assertAlmostEqual(model.g.real, expected_g.real)
+        self.assertAlmostEqual(model.g.imag, expected_g.imag)
+        self.assertEqual(model.center_reference_hz, 1010.0)
+        self.assertEqual(model.version, 2)
+
+
+class FmMagnitudeResonanceTests(unittest.TestCase):
+    @staticmethod
+    def _lorentzian_derivative(frequency_hz: float, center_hz: float) -> float:
+        gamma_hz = 24.0
+        normalized = (frequency_hz - center_hz) / gamma_hz
+        return 2.0 * normalized / (gamma_hz * (1.0 + normalized**2) ** 2)
+
+    def test_r_double_lobes_are_grouped_into_two_physical_resonances(self) -> None:
+        frequencies = [float(value) for value in range(0, 1001, 2)]
+        phase = complex(math.cos(0.73), math.sin(0.73))
+        complex_values = [
+            phase
+            * (
+                self._lorentzian_derivative(frequency, 300.0)
+                + 0.85 * self._lorentzian_derivative(frequency, 700.0)
+            )
+            for frequency in frequencies
+        ]
+        r_values = [abs(value) for value in complex_values]
+        candidates = find_fm_magnitude_resonances(
+            frequencies,
+            r_values,
+            complex_values,
+            minimum_prominence_fraction=0.05,
+        )
+        left, right = select_fm_resonance_pair(
+            candidates,
+            delta_f_min_hz=350.0,
+            delta_f_max_hz=450.0,
+            ambiguity_score_ratio=0.98,
+        )
+        self.assertAlmostEqual(left.center_hz, 300.0, delta=3.0)
+        self.assertAlmostEqual(right.center_hz, 700.0, delta=3.0)
+        self.assertGreater(left.left_lobe_r, left.center_r)
+        self.assertGreater(left.right_lobe_r, left.center_r)
+        self.assertGreater(right.left_lobe_r, right.center_r)
+        self.assertGreater(right.right_lobe_r, right.center_r)
+        self.assertGreater(
+            left.complex_slope.real * phase.real
+            + left.complex_slope.imag * phase.imag,
+            0.0,
+        )
+        self.assertGreater(
+            right.complex_slope.real * phase.real
+            + right.complex_slope.imag * phase.imag,
+            0.0,
+        )
 
 
 class SpecPidTests(unittest.TestCase):

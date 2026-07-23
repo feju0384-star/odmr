@@ -53,9 +53,12 @@ from backend.app.services.dual_peak_tracker import (
     PeakTracker,
     QualityResult,
     SpecPidController,
+    blend_symmetric_complex_probe,
     calculate_aligned_output,
     calculate_frequency_error,
+    find_fm_magnitude_resonances,
     fit_complex_affine_model,
+    select_fm_resonance_pair,
     update_quality_state,
 )
 
@@ -3264,7 +3267,7 @@ class InstrumentManager:
         request: CurrentTrackingRequest,
         event_callback: Any | None = None,
     ) -> dict[str, Any]:
-        """按规范执行 DC 峰心 + 复数 b/g 鉴频的双峰交替闭环。"""
+        """按 FM 1f 的 R 双瓣谷定位 + 复数 b/g 鉴频执行双峰交替闭环。"""
         if np is None:
             raise RuntimeError("numpy 不可用，无法执行规范化双峰跟踪。")
         if self.lockin_device is None or self.lockin_session is None:
@@ -3354,81 +3357,33 @@ class InstrumentManager:
                 total_blocks=total_blocks,
             )
 
-        def estimate_fwhm(
-            frequency_hz: list[float],
-            dc_values: list[float],
-            center_hz: float,
-            baseline: float,
-        ) -> float:
-            frequency = np.asarray(frequency_hz, dtype=float)
-            dc = np.asarray(dc_values, dtype=float)
-            center_index = int(np.argmin(np.abs(frequency - center_hz)))
-            center_value = float(dc[center_index])
-            depth = max(float(baseline) - center_value, 0.0)
-            if depth <= 0:
-                return max(float(np.median(np.diff(frequency))) * 6.0, 1.0)
-            half_level = baseline - depth / 2.0
-            left_candidates = np.where(dc[:center_index] >= half_level)[0]
-            right_candidates = np.where(dc[center_index + 1 :] >= half_level)[0]
-            if not left_candidates.size or not right_candidates.size:
-                return max(float(np.median(np.diff(frequency))) * 6.0, 1.0)
-            left_hz = float(frequency[int(left_candidates[-1])])
-            right_hz = float(frequency[center_index + 1 + int(right_candidates[0])])
-            return max(right_hz - left_hz, float(np.median(np.diff(frequency))), 1.0)
-
         def detect_unique_peak_pair(
             frequency_hz: Any,
-            dc_values: list[float],
-        ) -> dict[str, float | int]:
-            frequency = np.asarray(frequency_hz, dtype=float)
-            dc = np.asarray(dc_values, dtype=float)
-            if frequency.size < 7 or frequency.size != dc.size:
-                raise RuntimeError("完整扫频有效点不足，无法识别双峰。")
-            smoothed = np.convolve(dc, np.asarray([0.25, 0.5, 0.25]), mode="same")
-            smoothed[0] = dc[0]
-            smoothed[-1] = dc[-1]
-            baseline = float(np.median(smoothed))
-            candidates: list[tuple[int, float]] = []
-            for index in range(1, smoothed.size - 1):
-                if smoothed[index] <= smoothed[index - 1] and smoothed[index] <= smoothed[index + 1]:
-                    candidates.append((index, max(0.0, baseline - float(smoothed[index]))))
-            if not candidates:
-                raise RuntimeError("完整扫频未发现共振最低点。")
-            max_depth = max(item[1] for item in candidates)
-            minimum_depth = request.minimum_peak_prominence_fraction * max_depth
-            candidates = [item for item in candidates if item[1] >= minimum_depth and item[1] > 0]
-            pairs: list[tuple[float, int, int, float, float]] = []
-            for left_position, (left_index, left_depth) in enumerate(candidates):
-                for right_index, right_depth in candidates[left_position + 1 :]:
-                    separation_hz = float(frequency[right_index] - frequency[left_index])
-                    if not request.delta_f_min_hz <= separation_hz <= request.delta_f_max_hz:
-                        continue
-                    score = left_depth + right_depth
-                    pairs.append(
-                        (score, left_index, right_index, left_depth, right_depth)
-                    )
-            if not pairs:
-                raise RuntimeError("未找到满足 Δf 物理范围的唯一双峰组合。")
-            pairs.sort(key=lambda item: item[0], reverse=True)
-            if (
-                len(pairs) > 1
-                and pairs[0][0] > 0
-                and pairs[1][0] / pairs[0][0] >= request.peak_pair_ambiguity_score_ratio
-            ):
-                raise RuntimeError("双峰候选组合存在歧义，拒绝猜测峰身份。")
-            _, left_index, right_index, left_depth, right_depth = pairs[0]
-            left_hz = self._refine_extremum_frequency(frequency, dc, left_index)
-            right_hz = self._refine_extremum_frequency(frequency, dc, right_index)
-            if not left_hz < right_hz:
-                raise RuntimeError("双峰候选身份顺序异常。")
-            return {
-                "left_index": left_index,
-                "right_index": right_index,
-                "left_resonance_hz": left_hz,
-                "right_resonance_hz": right_hz,
-                "left_depth": left_depth,
-                "right_depth": right_depth,
-            }
+            measurements: list[PeakMeasurement],
+        ) -> tuple[Any, Any]:
+            candidates = find_fm_magnitude_resonances(
+                frequencies_hz=frequency_hz,
+                r_values=[item.dc for item in measurements],
+                complex_values=[item.z1 for item in measurements],
+                minimum_prominence_fraction=request.minimum_peak_prominence_fraction,
+            )
+            if len(candidates) < 2:
+                raise RuntimeError(
+                    "完整扫频未发现两个可靠的 FM 左瓣-谷-右瓣共振。"
+                )
+            try:
+                return select_fm_resonance_pair(
+                    candidates,
+                    delta_f_min_hz=request.delta_f_min_hz,
+                    delta_f_max_hz=request.delta_f_max_hz,
+                    ambiguity_score_ratio=request.peak_pair_ambiguity_score_ratio,
+                    maximum_slope_phase_difference_rad=min(
+                        math.pi / 2.0,
+                        2.0 * request.maximum_slope_angle_change_rad,
+                    ),
+                )
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
 
         def identity_bounds(
             tracker: PeakTracker,
@@ -3540,25 +3495,16 @@ class InstrumentManager:
                 self.measurement_state["progress"] = (index + 1) / max(1, frequencies.size)
             if not all(item.basic_valid() for item in scan_measurements):
                 raise RuntimeError("完整扫频包含无效采样，无法可靠分配双峰身份。")
-            dc_values = [item.dc for item in scan_measurements]
-            baseline = float(np.median(np.asarray(dc_values, dtype=float)))
-            pair = detect_unique_peak_pair(frequencies, dc_values)
-            left_center_hz = float(pair["left_resonance_hz"])
-            right_center_hz = float(pair["right_resonance_hz"])
+            left_candidate, right_candidate = detect_unique_peak_pair(
+                frequencies,
+                scan_measurements,
+            )
+            left_center_hz = float(left_candidate.center_hz)
+            right_center_hz = float(right_candidate.center_hz)
             if not left_center_hz < right_center_hz:
                 raise RuntimeError("双峰身份分配失败：左峰不小于右峰。")
-            left_fwhm_hz = estimate_fwhm(
-                frequencies.tolist(),
-                dc_values,
-                left_center_hz,
-                baseline,
-            )
-            right_fwhm_hz = estimate_fwhm(
-                frequencies.tolist(),
-                dc_values,
-                right_center_hz,
-                baseline,
-            )
+            left_fwhm_hz = float(left_candidate.fwhm_hz)
+            right_fwhm_hz = float(right_candidate.fwhm_hz)
             separation_hz = right_center_hz - left_center_hz
             if separation_hz < request.minimum_resolvable_separation_factor * max(
                 left_fwhm_hz,
@@ -3572,12 +3518,6 @@ class InstrumentManager:
             )
             left_band = (request.start_hz, midpoint_hz - guard_hz)
             right_band = (midpoint_hz + guard_hz, request.stop_hz)
-            left_dc = float(
-                np.interp(left_center_hz, frequencies, np.asarray(dc_values, dtype=float))
-            )
-            right_dc = float(
-                np.interp(right_center_hz, frequencies, np.asarray(dc_values, dtype=float))
-            )
             global_state = GlobalState.CALIBRATE
             publish(
                 {
@@ -3593,9 +3533,9 @@ class InstrumentManager:
                 peak_id=PeakId.LEFT,
                 center_hz=left_center_hz,
                 fwhm_hz=left_fwhm_hz,
-                depth_reference=max(baseline - left_dc, 0.0),
-                dc_center_reference=left_dc,
-                dc_baseline=baseline,
+                depth_reference=float(left_candidate.prominence_r),
+                dc_center_reference=float(left_candidate.center_r),
+                dc_baseline=float(left_candidate.lobe_level_r),
                 band_min_hz=left_band[0],
                 band_max_hz=left_band[1],
                 version=relock_count + 1,
@@ -3604,9 +3544,9 @@ class InstrumentManager:
                 peak_id=PeakId.RIGHT,
                 center_hz=right_center_hz,
                 fwhm_hz=right_fwhm_hz,
-                depth_reference=max(baseline - right_dc, 0.0),
-                dc_center_reference=right_dc,
-                dc_baseline=baseline,
+                depth_reference=float(right_candidate.prominence_r),
+                dc_center_reference=float(right_candidate.center_r),
+                dc_baseline=float(right_candidate.lobe_level_r),
                 band_min_hz=right_band[0],
                 band_max_hz=right_band[1],
                 version=relock_count + 1,
@@ -3667,8 +3607,28 @@ class InstrumentManager:
             )
             if delta_hz <= 0:
                 return False
-            minus = acquire_at(tracker.id, tracker.command_hz - delta_hz)
-            plus = acquire_at(tracker.id, tracker.command_hz + delta_hz)
+            verification_center_hz = (
+                tracker.motion.center_hz
+                if tracker.motion.initialized
+                else tracker.command_hz
+            )
+            verification_min_hz = max(
+                request.start_hz,
+                tracker.model.local_band_min_hz,
+            ) + delta_hz
+            verification_max_hz = min(
+                request.stop_hz,
+                tracker.model.local_band_max_hz,
+            ) - delta_hz
+            if verification_max_hz < verification_min_hz:
+                return False
+            verification_center_hz = max(
+                verification_min_hz,
+                min(verification_max_hz, verification_center_hz),
+            )
+            minus = acquire_at(tracker.id, verification_center_hz - delta_hz)
+            plus = acquire_at(tracker.id, verification_center_hz + delta_hz)
+            b_live = 0.5 * (minus.z1 + plus.z1)
             g_live = (plus.z1 - minus.z1) / (2.0 * delta_hz)
             if abs(tracker.model.g) ** 2 <= request.slope_epsilon:
                 return False
@@ -3694,11 +3654,20 @@ class InstrumentManager:
                     "slope_angle_change_rad": (
                         angle_change if math.isfinite(angle_change) else None
                     ),
+                    "verification_center_hz": verification_center_hz,
+                    "b_live_re": b_live.real if math.isfinite(b_live.real) else None,
+                    "b_live_im": b_live.imag if math.isfinite(b_live.imag) else None,
                 }
             )
             if valid:
-                tracker.model.g = 0.95 * tracker.model.g + 0.05 * g_live
-                tracker.model.version += 1
+                blend_symmetric_complex_probe(
+                    tracker.model,
+                    center_hz=verification_center_hz,
+                    minus_z=minus.z1,
+                    plus_z=plus.z1,
+                    delta_hz=delta_hz,
+                    blend_fraction=0.05,
+                )
                 tracker.last_slope_verification_s = max(
                     minus.timestamp_s,
                     plus.timestamp_s,
@@ -3939,30 +3908,52 @@ class InstrumentManager:
                         visit_peak(other, tracker)
                 if not all(item.basic_valid() for item in measurements):
                     continue
-                dc_values = [item.dc for item in measurements]
-                center_index = int(np.argmin(np.asarray(dc_values, dtype=float)))
-                center_hz = self._refine_extremum_frequency(
-                    frequencies,
-                    dc_values,
-                    center_index,
+                candidates = find_fm_magnitude_resonances(
+                    frequencies_hz=frequencies,
+                    r_values=[item.dc for item in measurements],
+                    complex_values=[item.z1 for item in measurements],
+                    minimum_prominence_fraction=request.minimum_peak_prominence_fraction,
                 )
-                baseline = float(np.median(np.asarray(dc_values, dtype=float)))
-                dc_center = float(
-                    np.interp(center_hz, frequencies, np.asarray(dc_values, dtype=float))
+                phase_compatible_candidates = []
+                for candidate in candidates:
+                    if not identity_min_hz <= candidate.center_hz <= identity_max_hz:
+                        continue
+                    phase_difference = abs(
+                        math.atan2(
+                            math.sin(
+                                cmath.phase(
+                                    candidate.complex_slope / tracker.model.g
+                                )
+                            ),
+                            math.cos(
+                                cmath.phase(
+                                    candidate.complex_slope / tracker.model.g
+                                )
+                            ),
+                        )
+                    )
+                    if phase_difference <= min(
+                        math.pi / 2.0,
+                        2.0 * request.maximum_slope_angle_change_rad,
+                    ):
+                        phase_compatible_candidates.append(candidate)
+                if not phase_compatible_candidates:
+                    continue
+                candidate = min(
+                    phase_compatible_candidates,
+                    key=lambda item: abs(item.center_hz - predicted_hz),
                 )
-                depth = max(baseline - dc_center, 0.0)
+                center_hz = float(candidate.center_hz)
+                dc_center = float(candidate.center_r)
+                depth = float(candidate.prominence_r)
+                baseline = float(candidate.lobe_level_r)
                 if (
                     independent_dc
                     and depth
                     < request.minimum_depth_fraction * tracker.model.depth_reference
                 ):
                     continue
-                fwhm_hz = estimate_fwhm(
-                    frequencies.tolist(),
-                    dc_values,
-                    center_hz,
-                    baseline,
-                )
+                fwhm_hz = float(candidate.fwhm_hz)
                 try:
                     model, model_timestamp_s = calibrate_peak(
                         peak_id=tracker.id,
@@ -4042,7 +4033,7 @@ class InstrumentManager:
                     "warning": (
                         ""
                         if independent_dc
-                        else "未配置独立 DC/峰存在性通道；当前以同通道 R 作为扫峰代理，并依靠周期复数斜率验证排除假锁。"
+                        else "未配置独立峰存在性通道；当前按 R≈|dS/df| 的 FM 双瓣谷识别共振，并依靠周期复数 b/g 验证排除假锁。"
                     ),
                 }
             )

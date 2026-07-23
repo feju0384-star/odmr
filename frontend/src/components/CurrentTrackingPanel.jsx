@@ -303,7 +303,7 @@ export function CurrentTrackingPanel({
               ? "输出已标记无效，正在全频段重捕获"
               : state === "CALIBRATE"
                 ? "正在标定左右峰复数 b/g 模型"
-                : "正在执行完整 DC 扫频"
+                : "正在执行完整 FM R 双瓣谷扫频"
           );
         } else if (payload.type === "current_tracking_models_calibrated") {
           setActiveTarget("complex_projection");
@@ -486,7 +486,7 @@ export function CurrentTrackingPanel({
   return (
     <SectionCard
       title="PID 闭环双峰连续跟踪"
-      description="用 DC 谱最低点定义左右物理峰心，在每个峰附近拟合独立复数 b/g 模型，将 X+jY 投影成有符号 Hz 误差，再按 L→R 交替调度驱动两个受限 PID。"
+      description="按 FM 1f 解调后的 R≈|dS/df|，用每个共振的左瓣—谷—右瓣定义物理峰心；再在峰心附近拟合独立复数 b/g 模型，将 X+jY 投影成有符号 Hz 误差，按 L→R 交替驱动两个受限 PID。"
       badge={lockLabel(lockState)}
     >
       <Group mb="md">
@@ -507,7 +507,7 @@ export function CurrentTrackingPanel({
           value={form.tracking_target}
           disabled
           data={[
-            { value: "complex_projection", label: "DC 峰心 + X/Y 复数投影" },
+            { value: "complex_projection", label: "FM R 双瓣谷 + X/Y 复数投影" },
           ]}
         />
         <NumberInput
@@ -714,7 +714,7 @@ export function CurrentTrackingPanel({
           物理峰心标定 {minimumCalibration?.point_count || 0} 点
         </Badge>
         <Badge variant="light" color={dcIndependent ? "teal" : "yellow"}>
-          {dcIndependent ? "独立峰存在性观测" : "R 代理 + 周期斜率验证"}
+          {dcIndependent ? "独立峰存在性观测" : "FM R 双瓣谷 + 周期 b/g 验证"}
         </Badge>
         <Badge variant="light" color="gray">电流幅值模式</Badge>
       </Group>

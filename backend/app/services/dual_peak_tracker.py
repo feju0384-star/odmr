@@ -127,6 +127,29 @@ class FrequencyError:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class FmResonanceCandidate:
+    """A physical ODMR resonance inferred from an FM-demodulated R trace.
+
+    For first-harmonic FM demodulation, ``R = abs(X + 1j*Y)`` is approximately
+    ``abs(dS/df)``.  A single resonance is therefore represented by two R lobes
+    separated by a central valley, rather than by one minimum in R.
+    """
+
+    center_hz: float
+    center_index: int
+    center_r: float
+    left_lobe_index: int
+    right_lobe_index: int
+    left_lobe_r: float
+    right_lobe_r: float
+    lobe_level_r: float
+    prominence_r: float
+    fwhm_hz: float
+    complex_slope: complex
+    score: float
+
+
 @dataclass
 class QualityResult:
     measurement_valid: bool
@@ -392,6 +415,201 @@ class TrackerOutput:
             "left_quality": self.left_quality,
             "right_quality": self.right_quality,
         }
+
+
+def _refine_local_minimum_hz(
+    frequency: Any,
+    values: Any,
+    index: int,
+) -> float:
+    """Refine an interior sampled minimum with a bounded three-point parabola."""
+    index = int(index)
+    if index <= 0 or index >= len(frequency) - 1:
+        return float(frequency[index])
+    x1, x2, x3 = (float(frequency[index + offset]) for offset in (-1, 0, 1))
+    y1, y2, y3 = (float(values[index + offset]) for offset in (-1, 0, 1))
+    denominator = (x1 - x2) * (x1 - x3) * (x2 - x3)
+    if abs(denominator) <= 1e-30:
+        return x2
+    a = (x3 * (y2 - y1) + x2 * (y1 - y3) + x1 * (y3 - y2)) / denominator
+    b = (
+        x3 * x3 * (y1 - y2)
+        + x2 * x2 * (y3 - y1)
+        + x1 * x1 * (y2 - y3)
+    ) / denominator
+    if not math.isfinite(a) or not math.isfinite(b) or a <= 0:
+        return x2
+    vertex = -b / (2.0 * a)
+    return max(x1, min(x3, float(vertex)))
+
+
+def find_fm_magnitude_resonances(
+    frequencies_hz: Any,
+    r_values: Any,
+    complex_values: Any,
+    *,
+    minimum_prominence_fraction: float,
+) -> list[FmResonanceCandidate]:
+    """Find ``lobe - valley - lobe`` resonances in a 1f FM magnitude scan.
+
+    The complex samples are retained because the apparent valley between two
+    different resonances can also be bracketed by R lobes.  Its complex slope is
+    reversed, which lets pair selection reject that false center.
+    """
+    if np is None:
+        raise RuntimeError("numpy 不可用，无法识别 FM 解调共振。")
+    frequency = np.asarray(frequencies_hz, dtype=float)
+    r_array = np.asarray(r_values, dtype=float)
+    z_array = np.asarray(complex_values, dtype=complex)
+    if frequency.ndim != 1 or frequency.size < 7:
+        raise ValueError("FM 扫频有效点不足。")
+    if frequency.size != r_array.size or frequency.size != z_array.size:
+        raise ValueError("FM 扫频的频率、R 与复数采样长度不一致。")
+    if not (
+        np.all(np.isfinite(frequency))
+        and np.all(np.isfinite(r_array))
+        and np.all(np.isfinite(z_array.real))
+        and np.all(np.isfinite(z_array.imag))
+    ):
+        raise ValueError("FM 扫频包含 NaN/Inf。")
+    if np.any(np.diff(frequency) <= 0):
+        raise ValueError("FM 扫频频率必须严格递增。")
+    if not 0.0 <= minimum_prominence_fraction <= 1.0:
+        raise ValueError("FM 峰瓣显著度比例必须位于 [0, 1]。")
+
+    smoothed = np.convolve(r_array, np.asarray([0.25, 0.5, 0.25]), mode="same")
+    smoothed[0] = r_array[0]
+    smoothed[-1] = r_array[-1]
+    maxima = [
+        index
+        for index in range(1, smoothed.size - 1)
+        if smoothed[index] >= smoothed[index - 1]
+        and smoothed[index] >= smoothed[index + 1]
+        and (
+            smoothed[index] > smoothed[index - 1]
+            or smoothed[index] > smoothed[index + 1]
+        )
+    ]
+    raw_candidates: list[FmResonanceCandidate] = []
+    for left_index, right_index in zip(maxima, maxima[1:]):
+        if right_index - left_index < 2:
+            continue
+        center_index = left_index + int(
+            np.argmin(smoothed[left_index : right_index + 1])
+        )
+        if center_index <= left_index or center_index >= right_index:
+            continue
+        left_prominence = float(smoothed[left_index] - smoothed[center_index])
+        right_prominence = float(smoothed[right_index] - smoothed[center_index])
+        prominence = min(left_prominence, right_prominence)
+        if prominence <= 0:
+            continue
+        lobe_balance = prominence / max(left_prominence, right_prominence, 1e-30)
+        lobe_span_hz = float(frequency[right_index] - frequency[left_index])
+        complex_slope = complex(
+            (z_array[right_index] - z_array[left_index]) / lobe_span_hz
+        )
+        if not math.isfinite(abs(complex_slope)) or abs(complex_slope) <= 0:
+            continue
+        center_hz = _refine_local_minimum_hz(frequency, smoothed, center_index)
+        center_r = float(np.interp(center_hz, frequency, r_array))
+        left_lobe_r = float(r_array[left_index])
+        right_lobe_r = float(r_array[right_index])
+        raw_candidates.append(
+            FmResonanceCandidate(
+                center_hz=center_hz,
+                center_index=center_index,
+                center_r=center_r,
+                left_lobe_index=left_index,
+                right_lobe_index=right_index,
+                left_lobe_r=left_lobe_r,
+                right_lobe_r=right_lobe_r,
+                lobe_level_r=0.5 * (left_lobe_r + right_lobe_r),
+                prominence_r=prominence,
+                # Small-modulation Lorentzian derivative: lobe spacing = FWHM/sqrt(3).
+                fwhm_hz=max(math.sqrt(3.0) * lobe_span_hz, 1.0),
+                complex_slope=complex_slope,
+                score=prominence * lobe_balance,
+            )
+        )
+    if not raw_candidates:
+        return []
+    minimum_score = minimum_prominence_fraction * max(
+        candidate.score for candidate in raw_candidates
+    )
+    return [
+        candidate
+        for candidate in raw_candidates
+        if candidate.score >= minimum_score and candidate.score > 0
+    ]
+
+
+def select_fm_resonance_pair(
+    candidates: list[FmResonanceCandidate],
+    *,
+    delta_f_min_hz: float,
+    delta_f_max_hz: float,
+    ambiguity_score_ratio: float,
+    maximum_slope_phase_difference_rad: float = math.pi / 2.0,
+) -> tuple[FmResonanceCandidate, FmResonanceCandidate]:
+    """Select two physical resonances with compatible FM complex-slope phase."""
+    pairs: list[tuple[float, FmResonanceCandidate, FmResonanceCandidate]] = []
+    ordered = sorted(candidates, key=lambda candidate: candidate.center_hz)
+    for left_position, left in enumerate(ordered):
+        for right in ordered[left_position + 1 :]:
+            separation_hz = right.center_hz - left.center_hz
+            if not delta_f_min_hz <= separation_hz <= delta_f_max_hz:
+                continue
+            phase_difference = abs(
+                math.atan2(
+                    math.sin(cmath.phase(right.complex_slope / left.complex_slope)),
+                    math.cos(cmath.phase(right.complex_slope / left.complex_slope)),
+                )
+            )
+            if phase_difference > maximum_slope_phase_difference_rad:
+                continue
+            phase_score = max(0.0, math.cos(phase_difference))
+            score = (left.score + right.score) * (0.5 + 0.5 * phase_score)
+            pairs.append((score, left, right))
+    if not pairs:
+        raise ValueError("未找到满足 Δf 范围且 FM 复数斜率同向的双峰组合。")
+    pairs.sort(key=lambda item: item[0], reverse=True)
+    if (
+        len(pairs) > 1
+        and pairs[0][0] > 0
+        and pairs[1][0] / pairs[0][0] >= ambiguity_score_ratio
+    ):
+        raise ValueError("FM 双峰候选组合存在歧义，拒绝猜测峰身份。")
+    return pairs[0][1], pairs[0][2]
+
+
+def blend_symmetric_complex_probe(
+    model: ComplexPeakModel,
+    *,
+    center_hz: float,
+    minus_z: complex,
+    plus_z: complex,
+    delta_hz: float,
+    blend_fraction: float = 0.05,
+) -> tuple[complex, complex]:
+    """Update both b and g from a symmetric live probe around the peak center."""
+    if not math.isfinite(center_hz) or not math.isfinite(delta_hz) or delta_hz <= 0:
+        raise ValueError("实时复数探测中心或间隔无效。")
+    if not 0.0 < blend_fraction <= 1.0:
+        raise ValueError("实时复数模型更新比例必须位于 (0, 1]。")
+    values = (minus_z.real, minus_z.imag, plus_z.real, plus_z.imag)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("实时复数探测包含 NaN/Inf。")
+    b_live = 0.5 * (minus_z + plus_z)
+    g_live = (plus_z - minus_z) / (2.0 * delta_hz)
+    # b is the complex response at the physical resonance center, not at a fixed
+    # absolute frequency.  Blend it directly; translating it by g*delta_f would
+    # incorrectly turn genuine resonance motion into intercept drift.
+    model.b = (1.0 - blend_fraction) * model.b + blend_fraction * b_live
+    model.g = (1.0 - blend_fraction) * model.g + blend_fraction * g_live
+    model.center_reference_hz = float(center_hz)
+    model.version += 1
+    return b_live, g_live
 
 
 def fit_complex_affine_model(
