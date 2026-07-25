@@ -19,6 +19,7 @@ import {
   IconCpu,
   IconCurrentLocation,
   IconTopologyStar3,
+  IconWaveSine,
 } from "@tabler/icons-react";
 import { useLocation, useNavigate } from "react-router-dom";
 
@@ -29,6 +30,7 @@ const navItems = [
   { to: "/odmr", label: "ODMR 扫描", subtitle: "两种扫描方式", icon: IconChartLine },
   { to: "/current", label: "电流测量", subtitle: "标定与自动测量", icon: IconCurrentLocation },
   { to: "/state-estimation", label: "状态估计电流", subtitle: "EKF / UKF 双峰预测", icon: IconTopologyStar3 },
+  { to: "/streaming-current", label: "流式电流测量", subtitle: "Zurich 连续订阅", icon: IconWaveSine },
 ];
 
 function Sidebar({ onNavigate }) {
@@ -91,7 +93,7 @@ function Sidebar({ onNavigate }) {
             </Text>
           </div>
           <Badge variant="light" color="cyan" size="lg">
-            6 Pages
+            7 Pages
           </Badge>
         </Group>
       </Box>

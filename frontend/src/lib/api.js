@@ -31,7 +31,7 @@ async function downloadRequest(path) {
     blob: await response.blob(),
     filename: encodedName
       ? decodeURIComponent(encodedName)
-      : plainName || "current_tracking.xlsx",
+      : plainName || "current_tracking.csv",
   };
 }
 
@@ -95,6 +95,22 @@ export const api = {
     request("/state-estimation-current/stop", {
       method: "POST",
     }),
+  stopStreamingCurrent: () =>
+    request("/streaming-current/stop", {
+      method: "POST",
+    }),
+  streamingCurrentRecordingStatus: (sessionId = "") => {
+    const query = sessionId
+      ? `?session_id=${encodeURIComponent(sessionId)}`
+      : "";
+    return request(`/streaming-current/recording/status${query}`);
+  },
+  downloadStreamingCurrentRecording: (sessionId = "") => {
+    const query = sessionId
+      ? `?session_id=${encodeURIComponent(sessionId)}`
+      : "";
+    return downloadRequest(`/streaming-current/recording/download${query}`);
+  },
   currentTrackingRecordingStatus: (sessionId = "") => {
     const query = sessionId
       ? `?session_id=${encodeURIComponent(sessionId)}`

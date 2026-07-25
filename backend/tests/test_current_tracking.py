@@ -16,7 +16,9 @@ class CurrentTrackingRequestTests(unittest.TestCase):
         self.assertEqual(request.tracking_target, "complex_projection")
         self.assertGreater(request.verify_interval_visits, 0)
         self.assertTrue(request.record_enabled)
-        self.assertEqual(request.record_interval_s, 1.0)
+        self.assertEqual(request.record_batch_points, 100)
+        self.assertEqual(request.record_flush_interval_s, 1.0)
+        self.assertEqual(request.record_queue_capacity, 100_000)
 
     def test_legacy_r_or_zero_crossing_target_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
@@ -25,6 +27,31 @@ class CurrentTrackingRequestTests(unittest.TestCase):
     def test_invalid_probe_offset_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             CurrentTrackingRequest(probe_offset_hz=0.0)
+
+    def test_csv_queue_must_hold_at_least_two_batches(self) -> None:
+        with self.assertRaises(ValidationError):
+            CurrentTrackingRequest(
+                record_batch_points=600,
+                record_queue_capacity=1000,
+            )
+
+
+class MeasurementSettleTests(unittest.TestCase):
+    def test_no_fixed_five_millisecond_floor(self) -> None:
+        manager = object.__new__(InstrumentManager)
+        manager.lockin_state = {
+            "channels": [
+                {
+                    "input_signal": 0,
+                    "time_constant_ms": 0.82,
+                }
+            ]
+        }
+        self.assertAlmostEqual(
+            manager._measurement_settle_s(0, 0.1),
+            0.0041,
+            places=7,
+        )
 
 
 class HardwareLoopSimulationTests(unittest.TestCase):
@@ -74,6 +101,24 @@ class HardwareLoopSimulationTests(unittest.TestCase):
         manager.read_lockin_sample_for_channel = read_channel
         points = []
         timing_events = []
+        recorded_points = []
+
+        class RecordingCollector:
+            @staticmethod
+            def enqueue(point):
+                recorded_points.append(dict(point))
+                return True
+
+            @staticmethod
+            def status():
+                return {
+                    "status": "recording",
+                    "enqueued_rows": len(recorded_points),
+                    "rows_written": len(recorded_points),
+                    "dropped_rows": 0,
+                }
+
+        manager.current_tracking_recordings = RecordingCollector()
 
         def on_event(event):
             if event.get("type") == "current_tracking_timing":
@@ -107,6 +152,7 @@ class HardwareLoopSimulationTests(unittest.TestCase):
         result = manager.run_current_tracking(request, on_event)
         self.assertEqual(result["status"], "cancelled")
         self.assertEqual(len(points), 5)
+        self.assertEqual(len(recorded_points), 5)
         self.assertTrue(timing_events)
         self.assertIn("bottleneck", timing_events[-1])
         self.assertGreaterEqual(timing_events[-1]["measured_update_rate_hz"], 0.0)

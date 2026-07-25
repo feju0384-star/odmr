@@ -28,8 +28,10 @@ const DEFAULT_TRACKING_FORM = {
   sample_averages: 1,
   timing_report_interval_cycles: 10,
   record_enabled: true,
-  record_interval_s: 1,
   record_label: "",
+  record_batch_points: 100,
+  record_flush_interval_s: 1,
+  record_queue_capacity: 100_000,
   kp: 0.45,
   ki_per_s: 0.03,
   kd_s: 0,
@@ -282,6 +284,17 @@ export function CurrentTrackingPanel({
       });
       return;
     }
+    if (
+      form.record_enabled &&
+      form.record_queue_capacity < 2 * form.record_batch_points
+    ) {
+      notifications.show({
+        color: "red",
+        title: "CSV 队列过小",
+        message: "队列容量至少应为每批点数的 2 倍。",
+      });
+      return;
+    }
     if (!canConvertSelectedTarget) {
       notifications.show({
         color: "yellow",
@@ -437,7 +450,9 @@ export function CurrentTrackingPanel({
         ) {
           setIsTracking(false);
           setLockState("stopped");
-          setRecordingStatus(payload.result?.recording || recordingStatus);
+          setRecordingStatus(
+            (previous) => payload.result?.recording || previous
+          );
           setStatusText(
             payload.type === "current_tracking_cancelled" ? "跟踪已停止" : "跟踪时长结束"
           );
@@ -445,6 +460,9 @@ export function CurrentTrackingPanel({
         } else if (payload.type === "current_tracking_error") {
           setIsTracking(false);
           setLockState("error");
+          setRecordingStatus(
+            (previous) => payload.recording || previous
+          );
           setStatusText(payload.message || "PID 双峰跟踪失败");
           notifications.show({
             color: "red",
@@ -523,8 +541,8 @@ export function CurrentTrackingPanel({
       setRecordingStatus(statusResult?.data || recordingStatus);
       notifications.show({
         color: "teal",
-        title: "Excel 已生成",
-        message: "下载内容是截至当前时刻的 1 秒聚合数据快照。",
+        title: "CSV 已生成",
+        message: "下载内容包含截至当前时刻的全部 PID 电流输出点。",
       });
     } catch (error) {
       notifications.show({
@@ -864,10 +882,10 @@ export function CurrentTrackingPanel({
         </Text>
       </Group>
 
-      <SimpleGrid cols={{ base: 1, md: 3 }} mt="lg">
+      <SimpleGrid cols={{ base: 1, md: 2, xl: 5 }} mt="lg">
         <Switch
-          label="保存长期电流数据"
-          description="后台每秒聚合，CSV 增量落盘并可导出 Excel"
+          label="保存全部电流输出"
+          description="逐输出点入队，后台批量写 CSV"
           checked={form.record_enabled}
           disabled={isTracking}
           onChange={(event) =>
@@ -878,18 +896,52 @@ export function CurrentTrackingPanel({
           }
         />
         <NumberInput
-          label="保存间隔 (s)"
-          description="13 小时建议保持 1 s"
-          value={form.record_interval_s}
+          label="每批点数"
+          description="达到点数后一次 writerows"
+          value={form.record_batch_points}
           disabled={isTracking || !form.record_enabled}
-          min={0.1}
-          max={3600}
-          decimalScale={1}
-          onChange={updateNumber("record_interval_s", 0.1)}
+          min={1}
+          max={100000}
+          onChange={(value) =>
+            setForm((previous) => ({
+              ...previous,
+              record_batch_points: Math.max(
+                1,
+                Math.round(numberOr(value, previous.record_batch_points))
+              ),
+            }))
+          }
+        />
+        <NumberInput
+          label="最长批量间隔 (s)"
+          description="低速时也会定时 flush"
+          value={form.record_flush_interval_s}
+          disabled={isTracking || !form.record_enabled}
+          min={0.05}
+          max={60}
+          decimalScale={2}
+          onChange={updateNumber("record_flush_interval_s", 0.05)}
+        />
+        <NumberInput
+          label="队列容量"
+          description="队列写满会安全停止测量"
+          value={form.record_queue_capacity}
+          disabled={isTracking || !form.record_enabled}
+          min={1000}
+          max={5000000}
+          onChange={(value) =>
+            setForm((previous) => ({
+              ...previous,
+              record_queue_capacity: Math.max(
+                1000,
+                Math.round(numberOr(value, previous.record_queue_capacity))
+              ),
+            }))
+          }
         />
         <TextInput
           label="实验标签"
-          description="会写入文件名和参数表"
+          description="写入 CSV 文件名"
           value={form.record_label}
           disabled={isTracking || !form.record_enabled}
           maxLength={80}
@@ -922,14 +974,28 @@ export function CurrentTrackingPanel({
           loading={isDownloadingRecording}
           disabled={!recordingStatus?.download_available}
         >
-          下载 Excel 快照
+          下载 CSV 快照
         </Button>
         {form.record_enabled || recordingStatus?.session_id ? (
           <Badge
             variant="light"
             color={recordingStatus?.status === "recording" ? "teal" : "gray"}
           >
-            已保存 {numberOr(recordingStatus?.rows_written, 0)} 点
+            已写 {numberOr(recordingStatus?.rows_written, 0)} / 入队{" "}
+            {numberOr(recordingStatus?.enqueued_rows, 0)} 点
+          </Badge>
+        ) : null}
+        {recordingStatus?.session_id ? (
+          <Badge
+            variant="light"
+            color={
+              numberOr(recordingStatus?.dropped_rows, 0) > 0
+                ? "red"
+                : "gray"
+            }
+          >
+            待写 {numberOr(recordingStatus?.queue_depth, 0)}，丢失{" "}
+            {numberOr(recordingStatus?.dropped_rows, 0)}
           </Badge>
         ) : null}
         <Badge variant="light" color={minimumCalibration ? "teal" : "gray"}>
@@ -1052,7 +1118,7 @@ export function CurrentTrackingPanel({
         <MetricCard
           label="显式稳定等待"
           value={formatMs(timingDiagnostics?.stage_mean_ms?.settle_ms)}
-          hint={`配置 ${formatMs(timingDiagnostics?.configured_tracking_settle_ms)} / 实际下限 ${formatMs(timingDiagnostics?.effective_settle_ms)}`}
+          hint={`配置 ${formatMs(timingDiagnostics?.configured_tracking_settle_ms)} / 实际等待 ${formatMs(timingDiagnostics?.effective_settle_ms)}`}
         />
         <MetricCard
           label="Zurich 设备锁等待"

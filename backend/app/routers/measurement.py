@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 from backend.app.schemas.instruments import (
     CurrentScanRequest,
@@ -49,23 +50,28 @@ async def download_current_tracking_recording(
     session_id: str | None = Query(default=None),
 ) -> FileResponse:
     try:
-        path, _ = await asyncio.to_thread(
+        path, is_temporary = await asyncio.to_thread(
             manager.export_current_tracking_recording,
             session_id,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Excel 导出失败: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"CSV 导出失败: {exc}") from exc
     return FileResponse(
         path=path,
-        filename=path.name,
-        media_type=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        filename=(
+            path.name.replace(".snapshot_", "current_tracking_snapshot_")
+            if is_temporary
+            else path.name
         ),
+        media_type="text/csv; charset=utf-8",
         headers={"Cache-Control": "no-store"},
+        background=(
+            BackgroundTask(path.unlink, missing_ok=True)
+            if is_temporary
+            else None
+        ),
     )
 
 
@@ -301,6 +307,17 @@ async def current_tracking_ws(websocket: WebSocket) -> None:
         result = await worker
         status = str(result.get("status", "completed"))
         manager.finish_current_tracking(request, result, status=status)
+        status = str(result.get("status", status))
+        if status == "error":
+            await websocket.send_json(
+                {
+                    "type": "current_tracking_error",
+                    "message": result.get("recording_error")
+                    or "连续跟踪CSV记录失败。",
+                    "recording": result.get("recording"),
+                }
+            )
+            return
         await websocket.send_json(
             {
                 "type": (

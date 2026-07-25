@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class LabOneServerConfig(BaseModel):
@@ -126,8 +126,10 @@ class CurrentTrackingRequest(BaseModel):
     sample_averages: int = Field(default=1, ge=1, le=100)
     timing_report_interval_cycles: int = Field(default=10, ge=1, le=10000)
     record_enabled: bool = True
-    record_interval_s: float = Field(default=1.0, ge=0.1, le=3600.0)
     record_label: str = Field(default="", max_length=80)
+    record_batch_points: int = Field(default=100, ge=1, le=100_000)
+    record_flush_interval_s: float = Field(default=1.0, ge=0.05, le=60.0)
+    record_queue_capacity: int = Field(default=100_000, ge=1_000, le=5_000_000)
     kp: float = Field(default=0.45, ge=0.0, le=100.0)
     ki_per_s: float = Field(default=0.03, ge=0.0, le=1000.0)
     kd_s: float = Field(default=0.0, ge=0.0, le=1000.0)
@@ -177,6 +179,12 @@ class CurrentTrackingRequest(BaseModel):
     calibration_delta_f_min_hz: float | None = None
     calibration_delta_f_max_hz: float | None = None
     current_polarity_mode: Literal["magnitude", "signed_external"] = "magnitude"
+
+    @model_validator(mode="after")
+    def validate_recording_parameters(self) -> "CurrentTrackingRequest":
+        if self.record_queue_capacity < 2 * self.record_batch_points:
+            raise ValueError("CSV队列容量至少应为批量点数的2倍。")
+        return self
 
 
 class ApiResponse(BaseModel):

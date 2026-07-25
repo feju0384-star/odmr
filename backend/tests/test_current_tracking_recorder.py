@@ -1,172 +1,113 @@
 import csv
-import json
 import tempfile
 import unittest
-from datetime import datetime
 from pathlib import Path
 
-from openpyxl import load_workbook
-
-from backend.app.services.current_tracking_recorder import (
-    CurrentTrackingRecordingManager,
+from backend.app.services.high_rate_csv_recorder import (
+    HighRateCsvRecordingManager,
 )
 
 
-def tracking_point(
-    elapsed_s: float,
-    current_a: float | None,
-    *,
-    valid: bool = True,
-    invalid_reason: str = "",
-) -> dict:
+def tracking_point(index: int, *, valid: bool = True) -> dict:
+    elapsed_s = index / 20.0
     return {
         "elapsed_s": elapsed_s,
+        "cycle_index": index + 1,
         "valid": valid,
-        "invalid_reason": invalid_reason,
-        "estimated_current_a": current_a,
+        "invalid_reason": "" if valid else "left_stale",
+        "estimated_current_a": 2.0 + index * 1e-6 if valid else None,
         "current_sigma_a": 0.004,
-        "left_frequency_hz": 2.865e9 + elapsed_s,
-        "right_frequency_hz": 2.875e9 + elapsed_s,
+        "left_frequency_hz": 2.865e9 + index,
+        "right_frequency_hz": 2.875e9 + index,
         "splitting_hz": 10e6,
         "delta_f_sigma_hz": 1500.0,
-        "common_mode_hz": 2.87e9 + elapsed_s,
+        "common_mode_hz": 2.87e9 + index,
+        "tracking_target": "complex_projection",
+        "global_state": "TRACK",
         "left_state": "LOCKED",
         "right_state": "LOCKED",
-        "left_error_hz": 120.0,
-        "right_error_hz": -80.0,
         "left_quality": 0.95,
         "right_quality": 0.96,
+        "dc_independent": False,
+        "left_error_hz": 120.0,
+        "right_error_hz": -80.0,
         "relock_count": 0,
         "lost_lock_count": 0,
-        "timing": {"measured_update_rate_hz": 5.0},
+        "timing": {
+            "measured_update_rate_hz": 20.0,
+            "acquisition_median_ms": 6.0,
+            "cycle_median_ms": 50.0,
+        },
     }
 
 
-class CurrentTrackingRecorderTests(unittest.TestCase):
-    def test_one_second_aggregation_and_excel_export(self) -> None:
+class CurrentTrackingCsvRecorderTests(unittest.TestCase):
+    def test_every_pid_output_is_saved_in_batched_csv(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = CurrentTrackingRecordingManager(
-                Path(temporary_directory) / "records"
+            manager = HighRateCsvRecordingManager(
+                Path(temporary_directory),
+                filename_prefix="current_tracking",
             )
             started = manager.start(
-                interval_s=1.0,
                 label="2A_13h",
-                request_snapshot={"record_interval_s": 1.0, "kp": 0.45},
-                device_snapshot={"microwave": {"idn": "KEYSIGHT,N5181B"}},
+                batch_points=64,
+                flush_interval_s=0.2,
+                queue_capacity=5000,
             )
-            session_id = started["session_id"]
-
-            self.assertFalse(manager.record_point(tracking_point(0.0, 2.0))[0])
-            self.assertFalse(manager.record_point(tracking_point(0.4, 2.004))[0])
-            wrote, status = manager.record_point(tracking_point(1.1, 1.996))
-            self.assertTrue(wrote)
-            self.assertEqual(status["rows_written"], 1)
-
-            manager.record_point(
-                tracking_point(
-                    1.5,
-                    None,
-                    valid=False,
-                    invalid_reason="left_stale",
+            point_count = 1000
+            for index in range(point_count):
+                self.assertTrue(
+                    manager.enqueue(
+                        tracking_point(index, valid=index % 10 != 0)
+                    )
                 )
-            )
-            manager.record_point(tracking_point(2.2, 2.008))
             finished = manager.finish("completed")
 
-            self.assertEqual(finished["rows_written"], 2)
-            self.assertEqual(finished["valid_rows"], 1)
-            self.assertTrue(finished["download_available"])
-            self.assertTrue(Path(finished["csv_path"]).exists())
-            self.assertTrue(Path(finished["xlsx_path"]).exists())
+            self.assertEqual(finished["session_id"], started["session_id"])
+            self.assertEqual(finished["rows_written"], point_count)
+            self.assertEqual(finished["enqueued_rows"], point_count)
+            self.assertEqual(finished["dropped_rows"], 0)
+            self.assertLess(finished["write_batches"], point_count / 10)
+            csv_path = Path(finished["csv_path"])
+            self.assertTrue(csv_path.name.startswith("current_tracking_"))
+            self.assertFalse(any(csv_path.parent.glob("*.xlsx")))
 
-            with Path(finished["csv_path"]).open(
+            with csv_path.open(
                 "r",
                 newline="",
                 encoding="utf-8-sig",
             ) as handle:
                 rows = list(csv.DictReader(handle))
-            self.assertEqual(len(rows), 2)
-            self.assertEqual(rows[0]["sample_count"], "3")
-            self.assertAlmostEqual(float(rows[0]["current_a"]), 2.0)
-            self.assertEqual(rows[1]["all_samples_valid"], "false")
-            self.assertEqual(rows[1]["invalid_reason"], "left_stale")
+            self.assertEqual(len(rows), point_count)
+            self.assertEqual(rows[0]["valid"], "false")
+            self.assertEqual(rows[0]["invalid_reason"], "left_stale")
+            self.assertEqual(rows[1]["tracking_target"], "complex_projection")
 
-            metadata = json.loads(
-                Path(finished["csv_path"])
-                .with_name("metadata.json")
-                .read_text(encoding="utf-8")
-            )
-            self.assertEqual(metadata["session_id"], session_id)
-            self.assertEqual(metadata["status"], "completed")
-
-            workbook = load_workbook(
-                finished["xlsx_path"],
-                read_only=True,
-                data_only=False,
-            )
-            try:
-                self.assertEqual(
-                    workbook.sheetnames,
-                    ["Summary", "Data", "Parameters"],
-                )
-                data = workbook["Data"]
-                data_rows = list(data.iter_rows())
-                self.assertEqual(len(data_rows), 3)
-                self.assertIsInstance(data_rows[1][0].value, datetime)
-                self.assertIsInstance(data_rows[1][3].value, (int, float))
-                self.assertEqual(data_rows[2][12].value, False)
-                summary = workbook["Summary"]
-                formulas = [
-                    cell.value
-                    for row in summary.iter_rows()
-                    for cell in row
-                    if isinstance(cell.value, str) and cell.value.startswith("=")
-                ]
-                self.assertTrue(formulas)
-            finally:
-                workbook.close()
-
-    def test_active_recording_can_export_a_snapshot(self) -> None:
+    def test_active_download_is_a_complete_csv_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = CurrentTrackingRecordingManager(Path(temporary_directory))
+            manager = HighRateCsvRecordingManager(
+                Path(temporary_directory),
+                filename_prefix="current_tracking",
+            )
             started = manager.start(
-                interval_s=1.0,
                 label="live",
-                request_snapshot={},
-                device_snapshot={},
+                batch_points=100,
+                flush_interval_s=10.0,
+                queue_capacity=1000,
             )
-            manager.record_point(tracking_point(0.0, 1.0))
-            manager.record_point(tracking_point(1.0, 1.1))
-            path, status = manager.export(started["session_id"])
+            for index in range(25):
+                self.assertTrue(manager.enqueue(tracking_point(index)))
 
-            self.assertTrue(path.exists())
-            self.assertEqual(status["status"], "recording")
-            self.assertEqual(status["rows_written"], 1)
-            manager.finish("cancelled")
-
-    def test_long_tracking_gap_is_not_blended_into_one_interval(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = CurrentTrackingRecordingManager(Path(temporary_directory))
-            manager.start(
-                interval_s=1.0,
-                label="gap",
-                request_snapshot={},
-                device_snapshot={},
-            )
-            manager.record_point(tracking_point(0.0, 1.0))
-            wrote, _ = manager.record_point(tracking_point(5.0, 3.0))
-            self.assertTrue(wrote)
-            finished = manager.finish("completed")
-
-            with Path(finished["csv_path"]).open(
+            snapshot, temporary = manager.export(started["session_id"])
+            self.assertTrue(temporary)
+            with snapshot.open(
                 "r",
                 newline="",
                 encoding="utf-8-sig",
             ) as handle:
                 rows = list(csv.DictReader(handle))
-            self.assertEqual(len(rows), 2)
-            self.assertAlmostEqual(float(rows[0]["current_a"]), 1.0)
-            self.assertAlmostEqual(float(rows[1]["current_a"]), 3.0)
+            self.assertEqual(len(rows), 25)
+            manager.finish("cancelled")
 
 
 if __name__ == "__main__":

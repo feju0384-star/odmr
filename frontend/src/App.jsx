@@ -10,6 +10,7 @@ const MicrowavePage = lazy(() => import("./pages/MicrowavePage"));
 const OdmrPage = lazy(() => import("./pages/OdmrPage"));
 const CurrentPage = lazy(() => import("./pages/CurrentPage"));
 const StateEstimationPage = lazy(() => import("./pages/StateEstimationPage"));
+const StreamingCurrentPage = lazy(() => import("./pages/StreamingCurrentPage"));
 
 export default function App() {
   return (
@@ -29,6 +30,7 @@ export default function App() {
           <Route path="/odmr" element={<OdmrPage />} />
           <Route path="/current" element={<CurrentPage />} />
           <Route path="/state-estimation" element={<StateEstimationPage />} />
+          <Route path="/streaming-current" element={<StreamingCurrentPage />} />
         </Routes>
       </Suspense>
     </AppFrame>

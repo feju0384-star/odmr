@@ -63,8 +63,8 @@ from backend.app.services.dual_peak_tracker import (
     update_quality_state,
 )
 from backend.app.services.tracking_runtime import TrackingTimingAnalyzer
-from backend.app.services.current_tracking_recorder import (
-    CurrentTrackingRecordingManager,
+from backend.app.services.high_rate_csv_recorder import (
+    HighRateCsvRecordingManager,
 )
 
 
@@ -218,8 +218,9 @@ class InstrumentManager:
         self.sampler_stop_event = threading.Event()
         self.odmr_stop_event = threading.Event()
         self.microwave_lock = threading.RLock()
-        self.current_tracking_recordings = CurrentTrackingRecordingManager(
-            Path(__file__).resolve().parents[3] / "data" / "current_tracking"
+        self.current_tracking_recordings = HighRateCsvRecordingManager(
+            Path(__file__).resolve().parents[3] / "data" / "current_tracking",
+            filename_prefix="current_tracking",
         )
 
         self.lockin_state: dict[str, Any] = {
@@ -441,7 +442,7 @@ class InstrumentManager:
         tc_ms = 0.0
         if 0 <= channel_index < len(channels):
             tc_ms = float(channels[channel_index].get("time_constant_ms", 0.0) or 0.0)
-        return max(float(settle_ms) / 1000.0, tc_ms / 1000.0 * 5.0, 0.005)
+        return max(float(settle_ms) / 1000.0, tc_ms / 1000.0 * 5.0)
 
     def _demod_index_for_channel(self, channel_index: int) -> int:
         channel_index = self._normalize_lockin_channel_index(channel_index)
@@ -2120,31 +2121,10 @@ class InstrumentManager:
         }
         if request.record_enabled:
             recording_state = self.current_tracking_recordings.start(
-                interval_s=request.record_interval_s,
                 label=request.record_label,
-                request_snapshot={
-                    **request.model_dump(),
-                    "channel_index": resolved_channel,
-                },
-                device_snapshot={
-                    "lockin": {
-                        "serial": self.lockin_state.get("serial", ""),
-                        "name": self.lockin_state.get("name", ""),
-                        "interface": self.lockin_state.get("interface", ""),
-                        "channel": (
-                            dict(self.lockin_state.get("channels", [])[resolved_channel])
-                            if 0
-                            <= resolved_channel
-                            < len(self.lockin_state.get("channels", []))
-                            else {}
-                        ),
-                    },
-                    "microwave": {
-                        "address": self.microwave_state.get("address", ""),
-                        "idn": self.microwave_state.get("idn", ""),
-                        "config": dict(self.microwave_state.get("config", {})),
-                    },
-                },
+                batch_points=request.record_batch_points,
+                flush_interval_s=request.record_flush_interval_s,
+                queue_capacity=request.record_queue_capacity,
             )
         tracking_state = {
             "lock_state": "acquiring",
@@ -2192,6 +2172,10 @@ class InstrumentManager:
                 "download_available": False,
             }
         )
+        if recording_state and recording_state.get("writer_error"):
+            status = "error"
+            result["status"] = "error"
+            result["recording_error"] = recording_state["writer_error"]
         result["recording"] = recording_state
         last_point = dict(result.get("last_point", {}) or {})
         tracking_state = {
@@ -2237,7 +2221,7 @@ class InstrumentManager:
     def export_current_tracking_recording(
         self,
         session_id: str | None = None,
-    ) -> tuple[Path, dict[str, Any]]:
+    ) -> tuple[Path, bool]:
         return self.current_tracking_recordings.export(session_id)
 
     def estimate_sensitivity_duration_s(self, request: SensitivityRequest) -> float:
@@ -3415,6 +3399,7 @@ class InstrumentManager:
         last_point: dict[str, Any] = {}
         timing_analyzer = TrackingTimingAnalyzer()
         latest_timing_snapshot: dict[str, Any] = {}
+        last_recording_event_s = 0.0
         runtime_lockin_filter: dict[str, float | int] = {}
         runtime_filter_reader = getattr(
             self,
@@ -4409,16 +4394,22 @@ class InstrumentManager:
                 recording_status = None
                 if request.record_enabled and recorder_manager is not None:
                     try:
-                        wrote_record, recording_status = (
-                            recorder_manager.record_point(last_point)
-                        )
+                        accepted = recorder_manager.enqueue(last_point)
+                        recording_status = recorder_manager.status()
                     except Exception as exc:
                         raise RuntimeError(
                             f"连续跟踪数据写盘失败，为防止长时实验无记录已停止: {exc}"
                         ) from exc
+                    if not accepted:
+                        raise RuntimeError(
+                            recording_status.get("writer_error")
+                            or "连续跟踪CSV记录队列写入失败。"
+                        )
                     if recording_status is not None:
                         last_point["recording"] = recording_status
-                        if wrote_record:
+                        now_s = clock()
+                        if now_s - last_recording_event_s >= 1.0:
+                            last_recording_event_s = now_s
                             publish(
                                 {
                                     "type": "current_tracking_recording",
